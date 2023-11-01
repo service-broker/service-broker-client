@@ -379,10 +379,18 @@ export class ServiceBroker {
     return JSON.parse(res.payload as string);
   }
 
-  async waitEndpoint(endpointId: string) {
+  private readonly waitPromises = new Map<string, Promise<void>>()
+
+  private async wait(endpointId: string) {
     const id = String(++this.pendingIdGen);
     await this.send({id, type: "SbEndpointWaitRequest", endpointId});
     await this.pendingResponse(id, Infinity);
+  }
+
+  waitEndpoint(endpointId: string) {
+    let promise = this.waitPromises.get(endpointId)
+    if (!promise) this.waitPromises.set(endpointId, promise = this.wait(endpointId).finally(() => this.waitPromises.delete(endpointId)))
+    return promise
   }
 
   async shutdown() {

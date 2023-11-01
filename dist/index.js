@@ -19,6 +19,7 @@ class ServiceBroker {
     constructor(url, logger) {
         this.url = url;
         this.logger = logger;
+        this.waitPromises = new Map();
         assert(url, "Missing args");
         this.providers = {};
         this.pending = {};
@@ -335,10 +336,16 @@ class ServiceBroker {
         const res = await this.pendingResponse(id);
         return JSON.parse(res.payload);
     }
-    async waitEndpoint(endpointId) {
+    async wait(endpointId) {
         const id = String(++this.pendingIdGen);
         await this.send({ id, type: "SbEndpointWaitRequest", endpointId });
         await this.pendingResponse(id, Infinity);
+    }
+    waitEndpoint(endpointId) {
+        let promise = this.waitPromises.get(endpointId);
+        if (!promise)
+            this.waitPromises.set(endpointId, promise = this.wait(endpointId).finally(() => this.waitPromises.delete(endpointId)));
+        return promise;
     }
     async shutdown() {
         this.shutdownFlag = true;
