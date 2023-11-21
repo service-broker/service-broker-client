@@ -12,15 +12,23 @@ export interface MessageWithHeader extends Message {
         [key: string]: any;
     };
 }
+interface Logger {
+    info: Console["info"];
+    error: Console["error"];
+}
 export declare class ServiceBroker {
-    private url;
-    private logger;
+    private opts;
     private readonly providers;
     private readonly pending;
     private pendingIdGen;
     private readonly conIter;
     private shutdownFlag;
-    constructor(url: string, logger: Console);
+    private logger;
+    constructor(opts: {
+        url: string;
+        logger?: Logger;
+        keepAliveIntervalSeconds?: number;
+    });
     private getConnection;
     private connect;
     private onMessage;
@@ -57,3 +65,4 @@ export declare class ServiceBroker {
     waitEndpoint(endpointId: string): Promise<void>;
     shutdown(): Promise<void>;
 }
+export {};

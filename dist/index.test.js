@@ -8,7 +8,7 @@ assert(process.env.SERVICE_BROKER_URL, "Missing env SERVICE_BROKER_URL");
 const serviceBrokerUrl = process.env.SERVICE_BROKER_URL;
 let sb;
 beforeAll(() => {
-    sb = new index_1.ServiceBroker(serviceBrokerUrl, console);
+    sb = new index_1.ServiceBroker({ url: serviceBrokerUrl });
 });
 afterAll(() => {
     sb.shutdown();

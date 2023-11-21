@@ -6,6 +6,7 @@ const stream_1 = require("stream");
 const WebSocket = require("ws");
 const iterator_1 = require("./iterator");
 const assert = require("assert");
+const state_machine_1 = require("@lsdsoftware/state-machine");
 const reservedFields = {
     from: undefined,
     to: undefined,
@@ -15,25 +16,71 @@ const reservedFields = {
     service: undefined,
     part: undefined
 };
+function makeKeepAlive(ws, intervalSeconds) {
+    const sm = (0, state_machine_1.makeStateMachine)({
+        IDLE: {
+            start() {
+                return "WAIT";
+            },
+            stop() {
+            }
+        },
+        WAIT: {
+            onTransitionIn() {
+                this.timer = setTimeout(() => sm.trigger("onTimeout"), intervalSeconds * 1000);
+            },
+            onTimeout() {
+                return "CHECK";
+            },
+            stop() {
+                clearTimeout(this.timer);
+                return "IDLE";
+            }
+        },
+        CHECK: {
+            onTransitionIn() {
+                ws.ping();
+                ws.once("pong", () => sm.trigger("onPong"));
+                this.timer = setTimeout(() => sm.trigger("onTimeout"), 3000);
+            },
+            onPong() {
+                clearTimeout(this.timer);
+                return "WAIT";
+            },
+            onTimeout() {
+                ws.terminate();
+                return "IDLE";
+            },
+            stop() {
+                clearTimeout(this.timer);
+                return "IDLE";
+            }
+        }
+    });
+    ws.once("open", () => sm.trigger("start"));
+    ws.once("close", () => sm.trigger("stop"));
+}
 class ServiceBroker {
-    constructor(url, logger) {
-        this.url = url;
-        this.logger = logger;
+    constructor(opts) {
+        var _a;
+        this.opts = opts;
         this.waitPromises = new Map();
-        assert(url, "Missing args");
         this.providers = {};
         this.pending = {};
         this.pendingIdGen = 0;
         this.conIter = new iterator_1.default(() => this.connect()).throttle(15000).keepWhile(con => con != null && !con.isClosed).noRace();
         this.shutdownFlag = false;
+        this.logger = (_a = opts.logger) !== null && _a !== void 0 ? _a : console;
     }
     async getConnection() {
         const con = await this.conIter.next();
         return con;
     }
     async connect() {
+        var _a;
         try {
-            const ws = new WebSocket(this.url);
+            const ws = new WebSocket(this.opts.url);
+            makeKeepAlive(ws, (_a = this.opts.keepAliveIntervalSeconds) !== null && _a !== void 0 ? _a : 30);
             await new Promise(function (fulfill, reject) {
                 ws.once("error", reject);
                 ws.once("open", () => {

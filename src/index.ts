@@ -3,6 +3,7 @@ import { PassThrough, Readable, Transform } from "stream";
 import * as WebSocket from "ws";
 import Iterator from "./iterator";
 import * as assert from "assert";
+import { makeStateMachine } from "@lsdsoftware/state-machine"
 
 
 export interface Message {
@@ -40,6 +41,55 @@ const reservedFields: {[key: string]: void} = {
   part: undefined
 };
 
+interface Logger {
+  info: Console["info"],
+  error: Console["error"]
+}
+
+function makeKeepAlive(ws: WebSocket, intervalSeconds: number) {
+  const sm = makeStateMachine({
+    IDLE: {
+      start() {
+        return "WAIT"
+      },
+      stop() {
+      }
+    },
+    WAIT: {
+      onTransitionIn(this: {timer: NodeJS.Timeout}) {
+        this.timer = setTimeout(() => sm.trigger("onTimeout"), intervalSeconds*1000)
+      },
+      onTimeout() {
+        return "CHECK"
+      },
+      stop(this: {timer: NodeJS.Timeout}) {
+        clearTimeout(this.timer)
+        return "IDLE"
+      }
+    },
+    CHECK: {
+      onTransitionIn(this: {timer: NodeJS.Timeout}) {
+        ws.ping()
+        ws.once("pong", () => sm.trigger("onPong"))
+        this.timer = setTimeout(() => sm.trigger("onTimeout"), 3000)
+      },
+      onPong(this: {timer: NodeJS.Timeout}) {
+        clearTimeout(this.timer)
+        return "WAIT"
+      },
+      onTimeout() {
+        ws.terminate()
+        return "IDLE"
+      },
+      stop(this: {timer: NodeJS.Timeout}) {
+        clearTimeout(this.timer)
+        return "IDLE"
+      }
+    }
+  })
+  ws.once("open", () => sm.trigger("start"))
+  ws.once("close", () => sm.trigger("stop"))
+}
 
 
 
@@ -49,14 +99,19 @@ export class ServiceBroker {
   private pendingIdGen: number;
   private readonly conIter: Iterator<Connection|null>;
   private shutdownFlag: boolean;
+  private logger: Logger;
 
-  constructor(private url: string, private logger: Console) {
-    assert(url, "Missing args");
+  constructor(private opts: {
+    url: string,
+    logger?: Logger,
+    keepAliveIntervalSeconds?: number,
+  }) {
     this.providers = {};
     this.pending = {};
     this.pendingIdGen = 0;
     this.conIter = new Iterator(() => this.connect()).throttle(15000).keepWhile(con => con != null && !con.isClosed).noRace();
     this.shutdownFlag = false;
+    this.logger = opts.logger ?? console
   }
 
   private async getConnection(): Promise<Connection> {
@@ -66,7 +121,8 @@ export class ServiceBroker {
 
   private async connect(): Promise<Connection|null> {
     try {
-      const ws = new WebSocket(this.url) as Connection;
+      const ws = new WebSocket(this.opts.url) as Connection;
+      makeKeepAlive(ws, this.opts.keepAliveIntervalSeconds ?? 30)
       await new Promise<void>(function(fulfill, reject) {
         ws.once("error", reject);
         ws.once("open", () => {

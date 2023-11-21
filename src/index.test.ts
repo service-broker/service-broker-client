@@ -12,7 +12,7 @@ const serviceBrokerUrl = process.env.SERVICE_BROKER_URL
 let sb: ServiceBroker
 
 beforeAll(() => {
-  sb = new ServiceBroker(serviceBrokerUrl, console)
+  sb = new ServiceBroker({url: serviceBrokerUrl})
 })
 
 afterAll(() => {
