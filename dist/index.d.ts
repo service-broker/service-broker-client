@@ -28,6 +28,7 @@ export declare class ServiceBroker {
         url: string;
         logger?: Logger;
         keepAliveIntervalSeconds?: number;
+        onConnect?: () => void;
     });
     private getConnection;
     private connect;

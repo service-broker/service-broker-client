@@ -105,6 +105,7 @@ export class ServiceBroker {
     url: string,
     logger?: Logger,
     keepAliveIntervalSeconds?: number,
+    onConnect?: () => void,
   }) {
     this.providers = {};
     this.pending = {};
@@ -144,6 +145,7 @@ export class ServiceBroker {
         type: "SbAdvertiseRequest",
         services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
       }));
+      this.opts.onConnect?.()
       return ws;
     }
     catch (err) {

@@ -62,7 +62,6 @@ function makeKeepAlive(ws, intervalSeconds) {
 }
 class ServiceBroker {
     constructor(opts) {
-        var _a;
         this.opts = opts;
         this.waitPromises = new Map();
         this.providers = {};
@@ -70,17 +69,16 @@ class ServiceBroker {
         this.pendingIdGen = 0;
         this.conIter = new iterator_1.default(() => this.connect()).throttle(15000).keepWhile(con => con != null && !con.isClosed).noRace();
         this.shutdownFlag = false;
-        this.logger = (_a = opts.logger) !== null && _a !== void 0 ? _a : console;
+        this.logger = opts.logger ?? console;
     }
     async getConnection() {
         const con = await this.conIter.next();
         return con;
     }
     async connect() {
-        var _a;
         try {
             const ws = new WebSocket(this.opts.url);
-            makeKeepAlive(ws, (_a = this.opts.keepAliveIntervalSeconds) !== null && _a !== void 0 ? _a : 30);
+            makeKeepAlive(ws, this.opts.keepAliveIntervalSeconds ?? 30);
             await new Promise(function (fulfill, reject) {
                 ws.once("error", reject);
                 ws.once("open", () => {
@@ -102,6 +100,7 @@ class ServiceBroker {
                 type: "SbAdvertiseRequest",
                 services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
             }));
+            this.opts.onConnect?.();
             return ws;
         }
         catch (err) {
