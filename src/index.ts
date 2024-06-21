@@ -1,9 +1,8 @@
-import pTimeout from "p-timeout";
+import { makeStateMachine } from "@lsdsoftware/state-machine";
+import assert from "assert";
 import { PassThrough, Readable, Transform } from "stream";
-import * as WebSocket from "ws";
+import WebSocket from "ws";
 import Iterator from "./iterator";
-import * as assert from "assert";
-import { makeStateMachine } from "@lsdsoftware/state-machine"
 
 
 export interface Message {
@@ -89,6 +88,16 @@ function makeKeepAlive(ws: WebSocket, intervalSeconds: number) {
   })
   ws.once("open", () => sm.trigger("start"))
   ws.once("close", () => sm.trigger("stop"))
+}
+
+function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
+  let timer: NodeJS.Timeout
+  return Promise.race([
+    promise
+      .finally(() => clearTimeout(timer)),
+    new Promise(f => timer = setTimeout(f, millis))
+      .then(() => Promise.reject(new Error("Timeout")))
+  ])
 }
 
 

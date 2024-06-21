@@ -1,11 +1,11 @@
 {
   "name": "@service-broker/service-broker-client",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Client library for interacting with a service broker",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "jest dist"
+    "test": "node dist/index.test"
   },
   "repository": {
     "type": "git",
@@ -18,15 +18,13 @@
   },
   "homepage": "https://github.com/service-broker/service-broker-client#readme",
   "devDependencies": {
-    "@types/jest": "^29.5.7",
-    "@types/node": "^20.8.10",
-    "@types/ws": "^8.5.8",
-    "dotenv": "^16.3.1",
-    "typescript": "^5.2.2"
+    "@types/node": "^20.14.7",
+    "@types/ws": "^8.5.10",
+    "dotenv": "^16.4.5",
+    "typescript": "^5.5.2"
   },
   "dependencies": {
     "@lsdsoftware/state-machine": "^1.2.0",
-    "p-timeout": "^4.1.0",
-    "ws": "^8.14.2"
+    "ws": "^8.17.1"
   }
 }
