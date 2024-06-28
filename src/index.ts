@@ -115,6 +115,7 @@ export class ServiceBroker {
     logger?: Logger,
     keepAliveIntervalSeconds?: number,
     onConnect?: () => void,
+    adminSecret?: string,
   }) {
     this.providers = {};
     this.pending = {};
@@ -151,6 +152,7 @@ export class ServiceBroker {
         }
       });
       ws.send(JSON.stringify({
+        adminSecret: this.opts.adminSecret,
         type: "SbAdvertiseRequest",
         services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
       }));
@@ -314,6 +316,7 @@ export class ServiceBroker {
       advertise: true
     };
     await this.send({
+      adminSecret: this.opts.adminSecret,
       type: "SbAdvertiseRequest",
       services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
     });
@@ -324,6 +327,7 @@ export class ServiceBroker {
     assert(this.providers[serviceName], `${serviceName} provider not exists`);
     delete this.providers[serviceName];
     await this.send({
+      adminSecret: this.opts.adminSecret,
       type: "SbAdvertiseRequest",
       services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
     });
@@ -441,16 +445,32 @@ export class ServiceBroker {
 
   async status() {
     const id = String(++this.pendingIdGen);
-    await this.send({id, type: "SbStatusRequest"});
+    await this.send({
+      id,
+      adminSecret: this.opts.adminSecret,
+      type: "SbStatusRequest"
+    })
     const res = await this.pendingResponse(id);
     return JSON.parse(res.payload as string);
+  }
+
+  async cleanup() {
+    await this.send({
+      adminSecret: this.opts.adminSecret,
+      type: "SbCleanupRequest"
+    })
   }
 
   private readonly waitPromises = new Map<string, Promise<void>>()
 
   private async wait(endpointId: string) {
     const id = String(++this.pendingIdGen);
-    await this.send({id, type: "SbEndpointWaitRequest", endpointId});
+    await this.send({
+      id,
+      adminSecret: this.opts.adminSecret,
+      type: "SbEndpointWaitRequest",
+      endpointId
+    })
     await this.pendingResponse(id, Infinity);
   }
 

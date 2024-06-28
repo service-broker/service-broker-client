@@ -1,6 +1,6 @@
 {
   "name": "@service-broker/service-broker-client",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Client library for interacting with a service broker",
   "main": "dist/index.js",
   "scripts": {
@@ -18,13 +18,13 @@
   },
   "homepage": "https://github.com/service-broker/service-broker-client#readme",
   "devDependencies": {
-    "@types/node": "^20.14.7",
+    "@types/node": "^20.14.9",
     "@types/ws": "^8.5.10",
     "dotenv": "^16.4.5",
     "typescript": "^5.5.2"
   },
   "dependencies": {
-    "@lsdsoftware/state-machine": "^1.2.0",
+    "@lsdsoftware/state-machine": "^1.2.1",
     "ws": "^8.17.1"
   }
 }

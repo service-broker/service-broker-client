@@ -27,6 +27,7 @@ export declare class ServiceBroker {
         logger?: Logger;
         keepAliveIntervalSeconds?: number;
         onConnect?: () => void;
+        adminSecret?: string;
     });
     private getConnection;
     private connect;
@@ -59,6 +60,7 @@ export declare class ServiceBroker {
     subscribe(topic: string, handler: (text: string) => void): Promise<void>;
     unsubscribe(topic: string): Promise<void>;
     status(): Promise<any>;
+    cleanup(): Promise<void>;
     private readonly waitPromises;
     private wait;
     waitEndpoint(endpointId: string): Promise<void>;
