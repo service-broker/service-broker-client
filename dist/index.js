@@ -63,6 +63,8 @@ function makeKeepAlive(ws, intervalSeconds) {
     ws.once("close", () => sm.trigger("stop"));
 }
 function pTimeout(promise, millis) {
+    if (millis == Infinity)
+        return promise;
     let timer;
     return Promise.race([
         promise

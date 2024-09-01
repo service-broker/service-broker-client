@@ -91,6 +91,7 @@ function makeKeepAlive(ws: WebSocket, intervalSeconds: number) {
 }
 
 function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
+  if (millis == Infinity) return promise
   let timer: NodeJS.Timeout
   return Promise.race([
     promise
