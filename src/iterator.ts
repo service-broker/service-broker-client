@@ -1,7 +1,7 @@
 import { promisify } from "util"
 
 export default class Iterator<T> {
-  constructor(public next: () => T|Promise<T>) {
+  constructor(public next: () => Promise<T>) {
   }
 
   noRace(): Iterator<T> {
@@ -14,7 +14,7 @@ export default class Iterator<T> {
   keepWhile(cond: (value: T) => boolean): Iterator<T> {
     let value: T;
     return new Iterator(async () => {
-      while (value === undefined || !await cond(value)) value = await this.next();
+      while (value === undefined || !cond(value)) value = await this.next();
       return value;
     });
   }

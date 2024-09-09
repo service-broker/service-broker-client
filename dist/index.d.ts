@@ -19,7 +19,7 @@ export declare class ServiceBroker {
     private readonly providers;
     private readonly pending;
     private pendingIdGen;
-    private readonly conIter;
+    private conProvider?;
     private shutdownFlag;
     private logger;
     constructor(opts: {
@@ -28,6 +28,7 @@ export declare class ServiceBroker {
         keepAliveIntervalSeconds?: number;
         onConnect?: () => void;
         adminSecret?: string;
+        disableReconnect?: boolean;
     });
     private getConnection;
     private connect;

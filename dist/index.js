@@ -80,13 +80,24 @@ class ServiceBroker {
         this.providers = {};
         this.pending = {};
         this.pendingIdGen = 0;
-        this.conIter = new iterator_1.default(() => this.connect()).throttle(15000).keepWhile(con => con != null && !con.isClosed).noRace();
         this.shutdownFlag = false;
         this.logger = opts.logger ?? console;
     }
-    async getConnection() {
-        const con = await this.conIter.next();
-        return con;
+    getConnection() {
+        if (!this.conProvider) {
+            if (this.opts.disableReconnect) {
+                let promise;
+                this.conProvider = () => promise ?? (promise = this.connect());
+            }
+            else {
+                const conIter = new iterator_1.default(() => this.connect().catch(err => this.logger.error(err)))
+                    .throttle(15000)
+                    .keepWhile(con => con != null && !con.isClosed)
+                    .noRace();
+                this.conProvider = async () => (await conIter.next());
+            }
+        }
+        return this.conProvider();
     }
     async connect() {
         try {
@@ -101,11 +112,11 @@ class ServiceBroker {
             });
             this.logger.info("Service broker connection established");
             ws.on("message", (data, isBinary) => this.onMessage(isBinary == false ? data.toString() : data));
-            ws.on("error", this.logger.error);
+            ws.on("error", err => this.logger.error(err));
             ws.once("close", (code, reason) => {
                 ws.isClosed = true;
                 if (!this.shutdownFlag) {
-                    this.logger.error("Service broker connection lost,", code, reason ? reason.toString() : "");
+                    this.logger.info("Service broker connection lost,", code, reason ? reason.toString() : "");
                     this.getConnection();
                 }
             });
@@ -118,8 +129,8 @@ class ServiceBroker {
             return ws;
         }
         catch (err) {
-            this.logger.error("Failed to connect to service broker,", String(err));
-            return null;
+            this.logger.info("Failed to connect to service broker,", String(err));
+            throw err;
         }
     }
     onMessage(data) {
@@ -426,8 +437,10 @@ class ServiceBroker {
     }
     async shutdown() {
         this.shutdownFlag = true;
-        const ws = await this.getConnection();
-        ws.close();
+        if (this.conProvider) {
+            const ws = await this.conProvider();
+            ws.close();
+        }
     }
 }
 exports.ServiceBroker = ServiceBroker;

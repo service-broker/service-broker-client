@@ -107,7 +107,7 @@ export class ServiceBroker {
   private readonly providers: {[key: string]: Provider};
   private readonly pending: {[key: string]: PendingResponse};
   private pendingIdGen: number;
-  private readonly conIter: Iterator<Connection|null>;
+  private conProvider?: () => Promise<Connection>
   private shutdownFlag: boolean;
   private logger: Logger;
 
@@ -117,21 +117,33 @@ export class ServiceBroker {
     keepAliveIntervalSeconds?: number,
     onConnect?: () => void,
     adminSecret?: string,
+    disableReconnect?: boolean,
   }) {
     this.providers = {};
     this.pending = {};
     this.pendingIdGen = 0;
-    this.conIter = new Iterator(() => this.connect()).throttle(15000).keepWhile(con => con != null && !con.isClosed).noRace();
     this.shutdownFlag = false;
     this.logger = opts.logger ?? console
   }
 
-  private async getConnection(): Promise<Connection> {
-    const con = await this.conIter.next();
-    return con!;
+  private getConnection(): Promise<Connection> {
+    if (!this.conProvider) {
+      if (this.opts.disableReconnect) {
+        let promise: Promise<Connection>|undefined
+        this.conProvider = () => promise ?? (promise = this.connect())
+      }
+      else {
+        const conIter = new Iterator(() => this.connect().catch(err => this.logger.error(err)))
+          .throttle(15000)
+          .keepWhile(con => con != null && !con.isClosed)
+          .noRace()
+        this.conProvider = async () => (await conIter.next())!
+      }
+    }
+    return this.conProvider()
   }
 
-  private async connect(): Promise<Connection|null> {
+  private async connect(): Promise<Connection> {
     try {
       const ws = new WebSocket(this.opts.url) as Connection;
       makeKeepAlive(ws, this.opts.keepAliveIntervalSeconds ?? 30)
@@ -144,11 +156,11 @@ export class ServiceBroker {
       });
       this.logger.info("Service broker connection established");
       ws.on("message", (data: Buffer, isBinary: unknown) => this.onMessage(isBinary == false ? data.toString() : data))
-      ws.on("error", this.logger.error);
+      ws.on("error", err => this.logger.error(err))
       ws.once("close", (code, reason) => {
         ws.isClosed = true;
         if (!this.shutdownFlag) {
-          this.logger.error("Service broker connection lost,", code, reason ? reason.toString() : "")
+          this.logger.info("Service broker connection lost,", code, reason ? reason.toString() : "")
           this.getConnection();
         }
       });
@@ -161,8 +173,8 @@ export class ServiceBroker {
       return ws;
     }
     catch (err) {
-      this.logger.error("Failed to connect to service broker,", String(err));
-      return null;
+      this.logger.info("Failed to connect to service broker,", String(err))
+      throw err
     }
   }
 
@@ -483,7 +495,9 @@ export class ServiceBroker {
 
   async shutdown() {
     this.shutdownFlag = true;
-    const ws = await this.getConnection();
-    ws.close();
+    if (this.conProvider) {
+      const ws = await this.conProvider()
+      ws.close();
+    }
   }
 }

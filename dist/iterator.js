@@ -14,7 +14,7 @@ class Iterator {
     keepWhile(cond) {
         let value;
         return new Iterator(async () => {
-            while (value === undefined || !await cond(value))
+            while (value === undefined || !cond(value))
                 value = await this.next();
             return value;
         });
