@@ -1,6 +1,6 @@
 {
   "name": "@service-broker/service-broker-client",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "Client library for interacting with a service broker",
   "main": "dist/index.js",
   "scripts": {

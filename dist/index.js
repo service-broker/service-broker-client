@@ -121,7 +121,7 @@ class ServiceBroker {
                 }
             });
             ws.send(JSON.stringify({
-                adminSecret: this.opts.adminSecret,
+                authToken: this.opts.authToken,
                 type: "SbAdvertiseRequest",
                 services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
             }));
@@ -292,7 +292,7 @@ class ServiceBroker {
             advertise: true
         };
         await this.send({
-            adminSecret: this.opts.adminSecret,
+            authToken: this.opts.authToken,
             type: "SbAdvertiseRequest",
             services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
         });
@@ -302,7 +302,7 @@ class ServiceBroker {
         (0, assert_1.default)(this.providers[serviceName], `${serviceName} provider not exists`);
         delete this.providers[serviceName];
         await this.send({
-            adminSecret: this.opts.adminSecret,
+            authToken: this.opts.authToken,
             type: "SbAdvertiseRequest",
             services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
         });
@@ -407,7 +407,6 @@ class ServiceBroker {
         const id = String(++this.pendingIdGen);
         await this.send({
             id,
-            adminSecret: this.opts.adminSecret,
             type: "SbStatusRequest"
         });
         const res = await this.pendingResponse(id);
@@ -415,7 +414,6 @@ class ServiceBroker {
     }
     async cleanup() {
         await this.send({
-            adminSecret: this.opts.adminSecret,
             type: "SbCleanupRequest"
         });
     }
@@ -423,7 +421,6 @@ class ServiceBroker {
         const id = String(++this.pendingIdGen);
         await this.send({
             id,
-            adminSecret: this.opts.adminSecret,
             type: "SbEndpointWaitRequest",
             endpointId
         });

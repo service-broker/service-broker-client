@@ -116,7 +116,7 @@ export class ServiceBroker {
     logger?: Logger,
     keepAliveIntervalSeconds?: number,
     onConnect?: () => void,
-    adminSecret?: string,
+    authToken?: string,
     disableReconnect?: boolean,
   }) {
     this.providers = {};
@@ -165,7 +165,7 @@ export class ServiceBroker {
         }
       });
       ws.send(JSON.stringify({
-        adminSecret: this.opts.adminSecret,
+        authToken: this.opts.authToken,
         type: "SbAdvertiseRequest",
         services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
       }));
@@ -329,7 +329,7 @@ export class ServiceBroker {
       advertise: true
     };
     await this.send({
-      adminSecret: this.opts.adminSecret,
+      authToken: this.opts.authToken,
       type: "SbAdvertiseRequest",
       services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
     });
@@ -340,7 +340,7 @@ export class ServiceBroker {
     assert(this.providers[serviceName], `${serviceName} provider not exists`);
     delete this.providers[serviceName];
     await this.send({
-      adminSecret: this.opts.adminSecret,
+      authToken: this.opts.authToken,
       type: "SbAdvertiseRequest",
       services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
     });
@@ -460,7 +460,6 @@ export class ServiceBroker {
     const id = String(++this.pendingIdGen);
     await this.send({
       id,
-      adminSecret: this.opts.adminSecret,
       type: "SbStatusRequest"
     })
     const res = await this.pendingResponse(id);
@@ -469,7 +468,6 @@ export class ServiceBroker {
 
   async cleanup() {
     await this.send({
-      adminSecret: this.opts.adminSecret,
       type: "SbCleanupRequest"
     })
   }
@@ -480,7 +478,6 @@ export class ServiceBroker {
     const id = String(++this.pendingIdGen);
     await this.send({
       id,
-      adminSecret: this.opts.adminSecret,
       type: "SbEndpointWaitRequest",
       endpointId
     })

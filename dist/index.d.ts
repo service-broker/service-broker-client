@@ -27,7 +27,7 @@ export declare class ServiceBroker {
         logger?: Logger;
         keepAliveIntervalSeconds?: number;
         onConnect?: () => void;
-        adminSecret?: string;
+        authToken?: string;
         disableReconnect?: boolean;
     });
     private getConnection;
