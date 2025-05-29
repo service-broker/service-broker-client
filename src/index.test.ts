@@ -126,7 +126,7 @@ describe("main", ({test}) => {
       });
     }
     catch (err: any) {
-      expect(err.message).toBe("No provider test-tts");
+      expect(err.message).toBe("NO_PROVIDER test-tts");
     }
   });
 })

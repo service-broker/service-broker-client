@@ -1,14 +1,36 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ServiceBroker = void 0;
-const state_machine_1 = require("@lsdsoftware/state-machine");
 const assert_1 = __importDefault(require("assert"));
+const rxjs = __importStar(require("rxjs"));
 const stream_1 = require("stream");
-const ws_1 = __importDefault(require("ws"));
-const iterator_1 = __importDefault(require("./iterator"));
+const websocket_1 = require("./websocket");
 const reservedFields = {
     from: undefined,
     to: undefined,
@@ -18,50 +40,6 @@ const reservedFields = {
     service: undefined,
     part: undefined
 };
-function makeKeepAlive(ws, intervalSeconds) {
-    const sm = (0, state_machine_1.makeStateMachine)({
-        IDLE: {
-            start() {
-                return "WAIT";
-            },
-            stop() {
-            }
-        },
-        WAIT: {
-            onTransitionIn() {
-                this.timer = setTimeout(() => sm.trigger("onTimeout"), intervalSeconds * 1000);
-            },
-            onTimeout() {
-                return "CHECK";
-            },
-            stop() {
-                clearTimeout(this.timer);
-                return "IDLE";
-            }
-        },
-        CHECK: {
-            onTransitionIn() {
-                ws.ping();
-                ws.once("pong", () => sm.trigger("onPong"));
-                this.timer = setTimeout(() => sm.trigger("onTimeout"), 3000);
-            },
-            onPong() {
-                clearTimeout(this.timer);
-                return "WAIT";
-            },
-            onTimeout() {
-                ws.terminate();
-                return "IDLE";
-            },
-            stop() {
-                clearTimeout(this.timer);
-                return "IDLE";
-            }
-        }
-    });
-    ws.once("open", () => sm.trigger("start"));
-    ws.once("close", () => sm.trigger("stop"));
-}
 function pTimeout(promise, millis) {
     if (millis == Infinity)
         return promise;
@@ -80,58 +58,42 @@ class ServiceBroker {
         this.providers = {};
         this.pending = {};
         this.pendingIdGen = 0;
-        this.shutdownFlag = false;
         this.logger = opts.logger ?? console;
-    }
-    getConnection() {
-        if (!this.conProvider) {
-            if (this.opts.disableReconnect) {
-                let promise;
-                this.conProvider = () => promise ?? (promise = this.connect());
+        this.shutdown$ = new rxjs.ReplaySubject(1);
+        this.connection$ = (0, websocket_1.connect)(opts.url, {
+            interval: (opts.keepAliveIntervalSeconds ?? 30) * 1000,
+            timeout: 3000
+        }).pipe(rxjs.concatMap(event => {
+            switch (event.type) {
+                case 'open':
+                    this.logger.info("Service broker connection established");
+                    event.connection.send(JSON.stringify({
+                        authToken: this.opts.authToken,
+                        type: "SbAdvertiseRequest",
+                        services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
+                    }));
+                    this.opts.onConnect?.();
+                    return rxjs.of(event.connection);
+                case 'message':
+                    try {
+                        this.onMessage(event.data);
+                    }
+                    catch (err) {
+                        this.logger.error(err);
+                    }
+                    return rxjs.EMPTY;
+                case 'error':
+                    this.logger.error(event.error);
+                    return rxjs.EMPTY;
+                case 'close':
+                    this.logger.info("Service broker connection lost,", event.code, event.reason);
+                    return rxjs.of(null);
             }
-            else {
-                const conIter = new iterator_1.default(() => this.connect().catch(err => this.logger.error(err)))
-                    .throttle(15000)
-                    .keepWhile(con => con != null && !con.isClosed)
-                    .noRace();
-                this.conProvider = async () => (await conIter.next());
+        }), rxjs.tap({
+            error: err => {
+                this.logger.info("Failed to connect to service broker,", String(err));
             }
-        }
-        return this.conProvider();
-    }
-    async connect() {
-        try {
-            const ws = new ws_1.default(this.opts.url);
-            makeKeepAlive(ws, this.opts.keepAliveIntervalSeconds ?? 30);
-            await new Promise(function (fulfill, reject) {
-                ws.once("error", reject);
-                ws.once("open", () => {
-                    ws.removeListener("error", reject);
-                    fulfill();
-                });
-            });
-            this.logger.info("Service broker connection established");
-            ws.on("message", (data, isBinary) => this.onMessage(isBinary == false ? data.toString() : data));
-            ws.on("error", err => this.logger.error(err));
-            ws.once("close", (code, reason) => {
-                ws.isClosed = true;
-                if (!this.shutdownFlag) {
-                    this.logger.info("Service broker connection lost,", code, reason ? reason.toString() : "");
-                    this.getConnection();
-                }
-            });
-            ws.send(JSON.stringify({
-                authToken: this.opts.authToken,
-                type: "SbAdvertiseRequest",
-                services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-            }));
-            this.opts.onConnect?.();
-            return ws;
-        }
-        catch (err) {
-            this.logger.info("Failed to connect to service broker,", String(err));
-            throw err;
-        }
+        }), opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
     }
     onMessage(data) {
         let msg;
@@ -228,7 +190,9 @@ class ServiceBroker {
         return { header, payload };
     }
     async send(header, payload) {
-        const ws = await this.getConnection();
+        const ws = await rxjs.firstValueFrom(this.connection$);
+        if (!ws)
+            throw new Error("No connection");
         const headerStr = JSON.stringify(header);
         if (payload) {
             if (typeof payload == "string") {
@@ -432,12 +396,8 @@ class ServiceBroker {
             this.waitPromises.set(endpointId, promise = this.wait(endpointId).finally(() => this.waitPromises.delete(endpointId)));
         return promise;
     }
-    async shutdown() {
-        this.shutdownFlag = true;
-        if (this.conProvider) {
-            const ws = await this.conProvider();
-            ws.close();
-        }
+    shutdown() {
+        this.shutdown$.next();
     }
 }
 exports.ServiceBroker = ServiceBroker;

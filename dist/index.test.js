@@ -119,7 +119,7 @@ const sb = new index_1.ServiceBroker({ url: process.env.SERVICE_BROKER_URL });
             });
         }
         catch (err) {
-            (0, test_utils_1.expect)(err.message).toBe("No provider test-tts");
+            (0, test_utils_1.expect)(err.message).toBe("NO_PROVIDER test-tts");
         }
     });
 });

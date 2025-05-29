@@ -16,12 +16,12 @@ interface Logger {
 }
 export declare class ServiceBroker {
     private opts;
+    private readonly connection$;
     private readonly providers;
     private readonly pending;
     private pendingIdGen;
-    private conProvider?;
-    private shutdownFlag;
     private logger;
+    private readonly shutdown$;
     constructor(opts: {
         url: string;
         logger?: Logger;
@@ -30,8 +30,6 @@ export declare class ServiceBroker {
         authToken?: string;
         disableReconnect?: boolean;
     });
-    private getConnection;
-    private connect;
     private onMessage;
     private onServiceRequest;
     private onServiceResponse;
@@ -65,6 +63,6 @@ export declare class ServiceBroker {
     private readonly waitPromises;
     private wait;
     waitEndpoint(endpointId: string): Promise<void>;
-    shutdown(): Promise<void>;
+    shutdown(): void;
 }
 export {};

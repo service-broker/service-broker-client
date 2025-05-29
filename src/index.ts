@@ -1,8 +1,7 @@
-import { makeStateMachine } from "@lsdsoftware/state-machine";
 import assert from "assert";
+import * as rxjs from "rxjs";
 import { PassThrough, Readable, Transform } from "stream";
-import WebSocket from "ws";
-import Iterator from "./iterator";
+import { connect, Connection } from "./websocket";
 
 
 export interface Message {
@@ -28,8 +27,6 @@ type PendingResponse = {
   process: (msg: MessageWithHeader) => void;
 };
 
-type Connection = WebSocket & {isClosed: boolean};
-
 const reservedFields: {[key: string]: void} = {
   from: undefined,
   to: undefined,
@@ -45,51 +42,6 @@ interface Logger {
   error: Console["error"]
 }
 
-function makeKeepAlive(ws: WebSocket, intervalSeconds: number) {
-  const sm = makeStateMachine({
-    IDLE: {
-      start() {
-        return "WAIT"
-      },
-      stop() {
-      }
-    },
-    WAIT: {
-      onTransitionIn(this: {timer: NodeJS.Timeout}) {
-        this.timer = setTimeout(() => sm.trigger("onTimeout"), intervalSeconds*1000)
-      },
-      onTimeout() {
-        return "CHECK"
-      },
-      stop(this: {timer: NodeJS.Timeout}) {
-        clearTimeout(this.timer)
-        return "IDLE"
-      }
-    },
-    CHECK: {
-      onTransitionIn(this: {timer: NodeJS.Timeout}) {
-        ws.ping()
-        ws.once("pong", () => sm.trigger("onPong"))
-        this.timer = setTimeout(() => sm.trigger("onTimeout"), 3000)
-      },
-      onPong(this: {timer: NodeJS.Timeout}) {
-        clearTimeout(this.timer)
-        return "WAIT"
-      },
-      onTimeout() {
-        ws.terminate()
-        return "IDLE"
-      },
-      stop(this: {timer: NodeJS.Timeout}) {
-        clearTimeout(this.timer)
-        return "IDLE"
-      }
-    }
-  })
-  ws.once("open", () => sm.trigger("start"))
-  ws.once("close", () => sm.trigger("stop"))
-}
-
 function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
   if (millis == Infinity) return promise
   let timer: NodeJS.Timeout
@@ -102,14 +54,13 @@ function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
 }
 
 
-
 export class ServiceBroker {
+  private readonly connection$: rxjs.Observable<Connection | null>
   private readonly providers: {[key: string]: Provider};
   private readonly pending: {[key: string]: PendingResponse};
   private pendingIdGen: number;
-  private conProvider?: () => Promise<Connection>
-  private shutdownFlag: boolean;
   private logger: Logger;
+  private readonly shutdown$: rxjs.Subject<void>
 
   constructor(private opts: {
     url: string,
@@ -122,63 +73,54 @@ export class ServiceBroker {
     this.providers = {};
     this.pending = {};
     this.pendingIdGen = 0;
-    this.shutdownFlag = false;
     this.logger = opts.logger ?? console
-  }
+    this.shutdown$ = new rxjs.ReplaySubject(1)
 
-  private getConnection(): Promise<Connection> {
-    if (!this.conProvider) {
-      if (this.opts.disableReconnect) {
-        let promise: Promise<Connection>|undefined
-        this.conProvider = () => promise ?? (promise = this.connect())
-      }
-      else {
-        const conIter = new Iterator(() => this.connect().catch(err => this.logger.error(err)))
-          .throttle(15000)
-          .keepWhile(con => con != null && !con.isClosed)
-          .noRace()
-        this.conProvider = async () => (await conIter.next())!
-      }
-    }
-    return this.conProvider()
-  }
-
-  private async connect(): Promise<Connection> {
-    try {
-      const ws = new WebSocket(this.opts.url) as Connection;
-      makeKeepAlive(ws, this.opts.keepAliveIntervalSeconds ?? 30)
-      await new Promise<void>(function(fulfill, reject) {
-        ws.once("error", reject);
-        ws.once("open", () => {
-          ws.removeListener("error", reject);
-          fulfill();
-        });
-      });
-      this.logger.info("Service broker connection established");
-      ws.on("message", (data: Buffer, isBinary: unknown) => this.onMessage(isBinary == false ? data.toString() : data))
-      ws.on("error", err => this.logger.error(err))
-      ws.once("close", (code, reason) => {
-        ws.isClosed = true;
-        if (!this.shutdownFlag) {
-          this.logger.info("Service broker connection lost,", code, reason ? reason.toString() : "")
-          this.getConnection();
+    this.connection$ = connect(opts.url, {
+      interval: (opts.keepAliveIntervalSeconds ?? 30) * 1000,
+      timeout: 3000
+    }).pipe(
+      rxjs.concatMap(event => {
+        switch (event.type) {
+          case 'open':
+            this.logger.info("Service broker connection established");
+            event.connection.send(
+              JSON.stringify({
+                authToken: this.opts.authToken,
+                type: "SbAdvertiseRequest",
+                services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
+              })
+            )
+            this.opts.onConnect?.()
+            return rxjs.of(event.connection)
+          case 'message':
+            try {
+              this.onMessage(event.data)
+            } catch (err) {
+              this.logger.error(err)
+            }
+            return rxjs.EMPTY
+          case 'error':
+            this.logger.error(event.error)
+            return rxjs.EMPTY
+          case 'close':
+            this.logger.info("Service broker connection lost,", event.code, event.reason)
+            return rxjs.of(null)
         }
-      });
-      ws.send(JSON.stringify({
-        authToken: this.opts.authToken,
-        type: "SbAdvertiseRequest",
-        services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-      }));
-      this.opts.onConnect?.()
-      return ws;
-    }
-    catch (err) {
-      this.logger.info("Failed to connect to service broker,", String(err))
-      throw err
-    }
+      }),
+      rxjs.tap({
+        error: err => {
+          this.logger.info("Failed to connect to service broker,", String(err))
+        }
+      }),
+      opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }),
+      opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }),
+      rxjs.takeUntil(this.shutdown$),
+      rxjs.shareReplay(1)
+    )
   }
 
-  private onMessage(data: string|Buffer) {
+  private onMessage(data: unknown) {
     let msg: MessageWithHeader;
     try {
       if (typeof data == "string") msg = this.messageFromString(data);
@@ -262,7 +204,8 @@ export class ServiceBroker {
   }
 
   private async send(header: {[key: string]: any}, payload?: string|Buffer|Readable) {
-    const ws = await this.getConnection();
+    const ws = await rxjs.firstValueFrom(this.connection$)
+    if (!ws) throw new Error("No connection")
     const headerStr = JSON.stringify(header);
     if (payload) {
       if (typeof payload == "string") {
@@ -278,7 +221,7 @@ export class ServiceBroker {
       }
       else if (payload.pipe) {
         const stream = this.packetizer(64*1000);
-        stream.on("data", data => this.send(Object.assign({}, header, {part:true}), data));
+        stream.on("data", data => this.send(Object.assign({}, header, {part: true}), data));
         stream.on("end", () => this.send(header));
         payload.pipe(stream);
       }
@@ -490,11 +433,7 @@ export class ServiceBroker {
     return promise
   }
 
-  async shutdown() {
-    this.shutdownFlag = true;
-    if (this.conProvider) {
-      const ws = await this.conProvider()
-      ws.close();
-    }
+  shutdown() {
+    this.shutdown$.next()
   }
 }
