@@ -60,40 +60,32 @@ class ServiceBroker {
         this.pendingIdGen = 0;
         this.logger = opts.logger ?? console;
         this.shutdown$ = new rxjs.ReplaySubject(1);
-        this.connection$ = (0, websocket_1.connect)(opts.url, {
-            interval: (opts.keepAliveIntervalSeconds ?? 30) * 1000,
-            timeout: 3000
-        }).pipe(rxjs.concatMap(event => {
-            switch (event.type) {
-                case 'open':
-                    this.logger.info("Service broker connection established");
-                    event.connection.send(JSON.stringify({
-                        authToken: this.opts.authToken,
-                        type: "SbAdvertiseRequest",
-                        services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-                    }));
-                    this.opts.onConnect?.();
-                    return rxjs.of(event.connection);
-                case 'message':
-                    try {
-                        this.onMessage(event.data);
-                    }
-                    catch (err) {
-                        this.logger.error(err);
-                    }
-                    return rxjs.EMPTY;
-                case 'error':
-                    this.logger.error(event.error);
-                    return rxjs.EMPTY;
-                case 'close':
-                    this.logger.info("Service broker connection lost,", event.code, event.reason);
-                    return rxjs.of(null);
-            }
-        }), rxjs.tap({
+        this.connection$ = (0, websocket_1.connect)(opts.url).pipe(rxjs.tap({
             error: err => {
                 this.logger.info("Failed to connect to service broker,", String(err));
             }
-        }), opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
+        }), opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), rxjs.exhaustMap(conn => {
+            this.logger.info("Service broker connection established");
+            conn.send(JSON.stringify({
+                authToken: this.opts.authToken,
+                type: "SbAdvertiseRequest",
+                services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
+            }));
+            this.opts.onConnect?.();
+            return rxjs.merge(conn.message$.pipe(rxjs.tap(event => {
+                try {
+                    this.onMessage(event.data);
+                }
+                catch (err) {
+                    this.logger.error(err);
+                }
+            })), conn.error$.pipe(rxjs.tap(event => this.logger.error(event.error)))).pipe(rxjs.ignoreElements(), rxjs.startWith(conn), rxjs.endWith(null), rxjs.takeUntil(rxjs.merge(conn.close$.pipe(rxjs.tap(event => this.logger.info("Service broker connection lost,", event.code, event.reason))), conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(rxjs.catchError(err => {
+                if (!(err instanceof rxjs.TimeoutError))
+                    this.logger.error(err);
+                this.logger.info("Service broker connection lost, keep-alive timeout");
+                return rxjs.of(0);
+            })))), rxjs.finalize(() => conn.close()));
+        }), opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
     }
     onMessage(data) {
         let msg;

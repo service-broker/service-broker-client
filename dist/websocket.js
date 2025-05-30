@@ -29,32 +29,22 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.connect = connect;
 const rxjs = __importStar(require("rxjs"));
 const ws_1 = __importDefault(require("ws"));
-function connect(url, keepAlive) {
+function connect(url) {
     return rxjs.defer(() => {
         const ws = new ws_1.default(url);
-        return rxjs.race(rxjs.fromEvent(ws, 'error', (event) => event).pipe(rxjs.map(event => { throw event.error; })), rxjs.fromEvent(ws, 'open').pipe(rxjs.take(1))).pipe(rxjs.map(() => ({
-            type: 'open',
-            connection: ws
-        })), rxjs.mergeWith(rxjs.fromEvent(ws, 'message', (event) => ({
-            type: 'message',
-            data: event.data
-        })), rxjs.fromEvent(ws, 'error', (event) => ({
-            type: 'error',
-            error: event.error
-        })), rxjs.fromEvent(ws, 'close', (event) => ({
-            type: 'close',
-            code: event.code,
-            reason: event.reason
-        })), keepAlive ? rxjs.interval(keepAlive.interval).pipe(rxjs.switchMap(() => {
-            ws.ping();
-            return rxjs.fromEventPattern(h => ws.on('pong', h), h => ws.off('pong', h)).pipe(rxjs.take(1), rxjs.ignoreElements(), rxjs.timeout({
-                each: keepAlive.timeout,
-                with: () => rxjs.of({
-                    type: 'close',
-                    code: 1006,
-                    reason: 'Keep alive timeout'
-                })
-            }));
-        })) : rxjs.EMPTY), rxjs.takeWhile(event => event.type !== 'close', true), rxjs.finalize(() => ws.close()));
+        return rxjs.race(rxjs.fromEvent(ws, 'error', (event) => event).pipe(rxjs.map(event => { throw event.error; })), rxjs.fromEvent(ws, 'open').pipe(rxjs.take(1), rxjs.map(() => makeConnection(ws))));
     });
+}
+function makeConnection(ws) {
+    return {
+        message$: rxjs.fromEvent(ws, 'message', (event) => event),
+        error$: rxjs.fromEvent(ws, 'error', (event) => event),
+        close$: rxjs.fromEvent(ws, 'close', (event) => event),
+        send: ws.send.bind(ws),
+        close: ws.close.bind(ws),
+        keepAlive: (interval, timeout) => rxjs.interval(interval).pipe(rxjs.switchMap(() => {
+            ws.ping();
+            return rxjs.fromEventPattern(h => ws.on('pong', h), h => ws.off('pong', h)).pipe(rxjs.timeout(timeout), rxjs.take(1), rxjs.ignoreElements());
+        }))
+    };
 }

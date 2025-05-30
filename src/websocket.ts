@@ -1,13 +1,16 @@
 import * as rxjs from "rxjs"
 import WebSocket, { CloseEvent, ErrorEvent, MessageEvent } from "ws"
 
-export type Connection = Pick<WebSocket, 'send'>
+export interface Connection {
+  message$: rxjs.Observable<MessageEvent>
+  error$: rxjs.Observable<ErrorEvent>
+  close$: rxjs.Observable<CloseEvent>
+  send: WebSocket['send']
+  close: WebSocket['close']
+  keepAlive(interval: number, timeout: number): rxjs.Observable<never>
+}
 
-
-export function connect(
-  url: string,
-  keepAlive?: { interval: number, timeout: number }
-) {
+export function connect(url: string) {
   return rxjs.defer(() => {
     const ws = new WebSocket(url)
     return rxjs.race(
@@ -15,50 +18,29 @@ export function connect(
         rxjs.map(event => { throw event.error })
       ),
       rxjs.fromEvent(ws, 'open').pipe(
-        rxjs.take(1)
+        rxjs.take(1),
+        rxjs.map(() => makeConnection(ws))
       )
-    ).pipe(
-      rxjs.map(() => ({
-        type: 'open' as const,
-        connection: ws as Connection
-      })),
-      rxjs.mergeWith(
-        rxjs.fromEvent(ws, 'message', (event: MessageEvent) => ({
-          type: 'message' as const,
-          data: event.data
-        })),
-        rxjs.fromEvent(ws, 'error', (event: ErrorEvent) => ({
-          type: 'error' as const,
-          error: event.error
-        })),
-        rxjs.fromEvent(ws, 'close', (event: CloseEvent) => ({
-          type: 'close' as const,
-          code: event.code,
-          reason: event.reason
-        })),
-        keepAlive ? rxjs.interval(keepAlive.interval).pipe(
-          rxjs.switchMap(() => {
-            ws.ping()
-            return rxjs.fromEventPattern(
-              h => ws.on('pong', h),
-              h => ws.off('pong', h)
-            ).pipe(
-              rxjs.take(1),
-              rxjs.ignoreElements(),
-              rxjs.timeout({
-                each: keepAlive.timeout,
-                with: () => rxjs.of({
-                  type: 'close' as const,
-                  code: 1006,
-                  reason: 'Keep alive timeout'
-                })
-              })
-            )
-          })
-        ) : rxjs.EMPTY
-      ),
-      rxjs.takeWhile(event => event.type !== 'close', true),
-      rxjs.finalize(() => ws.close())
     )
   })
+}
+
+function makeConnection(ws: WebSocket): Connection {
+  return {
+    message$: rxjs.fromEvent(ws, 'message', (event: MessageEvent) => event),
+    error$: rxjs.fromEvent(ws, 'error', (event: ErrorEvent) => event),
+    close$: rxjs.fromEvent(ws, 'close', (event: CloseEvent) => event),
+    send: ws.send.bind(ws),
+    close: ws.close.bind(ws),
+    keepAlive: (interval, timeout) => rxjs.interval(interval).pipe(
+      rxjs.switchMap(() => {
+        ws.ping()
+        return rxjs.fromEventPattern(h => ws.on('pong', h), h => ws.off('pong', h)).pipe(
+          rxjs.timeout(timeout),
+          rxjs.take(1),
+          rxjs.ignoreElements()
+        )
+      })
+    )
+  }
 }
