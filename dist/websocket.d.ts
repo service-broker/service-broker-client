@@ -1,3 +1,4 @@
+import { ClientRequestArgs } from "http";
 import * as rxjs from "rxjs";
 import WebSocket, { CloseEvent, ErrorEvent, MessageEvent } from "ws";
 export interface Connection {
@@ -8,4 +9,4 @@ export interface Connection {
     close: WebSocket['close'];
     keepAlive(interval: number, timeout: number): rxjs.Observable<never>;
 }
-export declare function connect(url: string): rxjs.Observable<Connection>;
+export declare function connect(address: string | URL, options?: WebSocket.ClientOptions | ClientRequestArgs): rxjs.Observable<Connection>;

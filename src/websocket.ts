@@ -1,3 +1,4 @@
+import { ClientRequestArgs } from "http"
 import * as rxjs from "rxjs"
 import WebSocket, { CloseEvent, ErrorEvent, MessageEvent } from "ws"
 
@@ -10,9 +11,9 @@ export interface Connection {
   keepAlive(interval: number, timeout: number): rxjs.Observable<never>
 }
 
-export function connect(url: string) {
+export function connect(address: string | URL, options?: WebSocket.ClientOptions | ClientRequestArgs) {
   return rxjs.defer(() => {
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(address, options)
     return rxjs.race(
       rxjs.fromEvent(ws, 'error', (event: ErrorEvent) => event).pipe(
         rxjs.map(event => { throw event.error })

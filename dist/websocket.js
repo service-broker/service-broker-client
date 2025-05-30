@@ -29,9 +29,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.connect = connect;
 const rxjs = __importStar(require("rxjs"));
 const ws_1 = __importDefault(require("ws"));
-function connect(url) {
+function connect(address, options) {
     return rxjs.defer(() => {
-        const ws = new ws_1.default(url);
+        const ws = new ws_1.default(address, options);
         return rxjs.race(rxjs.fromEvent(ws, 'error', (event) => event).pipe(rxjs.map(event => { throw event.error; })), rxjs.fromEvent(ws, 'open').pipe(rxjs.take(1), rxjs.map(() => makeConnection(ws))));
     });
 }
