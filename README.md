@@ -1,10 +1,29 @@
-# service-broker-client
-Client library for interacting with a service broker
+# @service-broker/client-node
+Node ESM client library for interacting with a service broker
+
+
+### Install
+```bash
+npm install @service-broker/client-node
+```
 
 
 ### Connect
 ```typescript
-const sb = new ServiceBroker("ws://sb.mydomain.com:8080", logger)
+const sb = new ServiceBroker({
+  // websocket URL of the service broker
+  url: string,
+  // if the service-broker requires providers to authenticate when advertising
+  authToken?: string,
+  // callback for when connection is established (or re-established)
+  onConnect?: () => void,
+  // disable auto-reconnect function (upon connect failure or connection loss)
+  disableAutoReconnect?: boolean,
+  // whether to send websocket pings periodically
+  keepAliveIntervalSeconds?: number,
+  // logger for info and errors
+  logger?: Logger,
+})
 ```
 
 

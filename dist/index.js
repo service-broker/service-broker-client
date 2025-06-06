@@ -1,36 +1,7 @@
-"use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ServiceBroker = void 0;
-const assert_1 = __importDefault(require("assert"));
-const rxjs = __importStar(require("rxjs"));
-const stream_1 = require("stream");
-const websocket_1 = require("./websocket");
+import assert from "assert";
+import * as rxjs from "rxjs";
+import { PassThrough, Transform } from "stream";
+import { connect } from "./websocket.js";
 const reservedFields = {
     from: undefined,
     to: undefined,
@@ -51,7 +22,7 @@ function pTimeout(promise, millis) {
             .then(() => Promise.reject(new Error("Timeout")))
     ]);
 }
-class ServiceBroker {
+export class ServiceBroker {
     constructor(opts) {
         this.opts = opts;
         this.waitPromises = new Map();
@@ -60,11 +31,11 @@ class ServiceBroker {
         this.pendingIdGen = 0;
         this.logger = opts.logger ?? console;
         this.shutdown$ = new rxjs.ReplaySubject(1);
-        this.connection$ = (0, websocket_1.connect)(opts.url).pipe(rxjs.tap({
+        this.connection$ = connect(opts.url).pipe(rxjs.tap({
             error: err => {
                 this.logger.info("Failed to connect to service broker,", String(err));
             }
-        }), opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), rxjs.exhaustMap(conn => {
+        }), opts.disableAutoReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), rxjs.exhaustMap(conn => {
             this.logger.info("Service broker connection established");
             conn.send(JSON.stringify({
                 authToken: this.opts.authToken,
@@ -85,7 +56,7 @@ class ServiceBroker {
                 this.logger.info("Service broker connection lost, keep-alive timeout");
                 return rxjs.of(0);
             })))), rxjs.finalize(() => conn.close()));
-        }), opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
+        }), opts.disableAutoReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
     }
     onMessage(data) {
         let msg;
@@ -213,7 +184,7 @@ class ServiceBroker {
     packetizer(size) {
         let buf;
         let pos;
-        return new stream_1.Transform({
+        return new Transform({
             transform: function (chunk, encoding, callback) {
                 while (chunk.length) {
                     if (!buf) {
@@ -240,8 +211,8 @@ class ServiceBroker {
         });
     }
     async advertise(service, handler) {
-        (0, assert_1.default)(service && service.name && handler, "Missing args");
-        (0, assert_1.default)(!this.providers[service.name], `${service.name} provider already exists`);
+        assert(service && service.name && handler, "Missing args");
+        assert(!this.providers[service.name], `${service.name} provider already exists`);
         this.providers[service.name] = {
             service,
             handler,
@@ -254,8 +225,8 @@ class ServiceBroker {
         });
     }
     async unadvertise(serviceName) {
-        (0, assert_1.default)(serviceName, "Missing args");
-        (0, assert_1.default)(this.providers[serviceName], `${serviceName} provider not exists`);
+        assert(serviceName, "Missing args");
+        assert(this.providers[serviceName], `${serviceName} provider not exists`);
         delete this.providers[serviceName];
         await this.send({
             authToken: this.opts.authToken,
@@ -264,8 +235,8 @@ class ServiceBroker {
         });
     }
     setServiceHandler(serviceName, handler) {
-        (0, assert_1.default)(serviceName && handler, "Missing args");
-        (0, assert_1.default)(!this.providers[serviceName], `${serviceName} provider already exists`);
+        assert(serviceName && handler, "Missing args");
+        assert(!this.providers[serviceName], `${serviceName} provider already exists`);
         this.providers[serviceName] = {
             service: { name: serviceName },
             handler,
@@ -273,7 +244,7 @@ class ServiceBroker {
         };
     }
     async request(service, req, timeout) {
-        (0, assert_1.default)(service && service.name && req, "Missing args");
+        assert(service && service.name && req, "Missing args");
         const id = String(++this.pendingIdGen);
         const promise = this.pendingResponse(id, timeout);
         const header = {
@@ -285,7 +256,7 @@ class ServiceBroker {
         return promise;
     }
     async notify(service, msg) {
-        (0, assert_1.default)(service && service.name && msg, "Missing args");
+        assert(service && service.name && msg, "Missing args");
         const header = {
             type: "ServiceRequest",
             service
@@ -293,7 +264,7 @@ class ServiceBroker {
         await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
     }
     async requestTo(endpointId, serviceName, req, timeout) {
-        (0, assert_1.default)(endpointId && serviceName && req, "Missing args");
+        assert(endpointId && serviceName && req, "Missing args");
         const id = String(++this.pendingIdGen);
         const promise = this.pendingResponse(id, timeout);
         const header = {
@@ -306,7 +277,7 @@ class ServiceBroker {
         return promise;
     }
     async notifyTo(endpointId, serviceName, msg) {
-        (0, assert_1.default)(endpointId && serviceName && msg, "Missing args");
+        assert(endpointId && serviceName && msg, "Missing args");
         const header = {
             to: endpointId,
             type: "ServiceRequest",
@@ -324,7 +295,7 @@ class ServiceBroker {
                     else {
                         if (res.header.part) {
                             if (!stream)
-                                fulfill({ header: res.header, payload: stream = new stream_1.PassThrough() });
+                                fulfill({ header: res.header, payload: stream = new PassThrough() });
                             stream.write(res.payload);
                         }
                         else {
@@ -345,18 +316,18 @@ class ServiceBroker {
         });
     }
     async publish(topic, text) {
-        (0, assert_1.default)(topic && text, "Missing args");
+        assert(topic && text, "Missing args");
         await this.send({
             type: "ServiceRequest",
             service: { name: "#" + topic }
         }, text);
     }
     async subscribe(topic, handler) {
-        (0, assert_1.default)(topic && handler, "Missing args");
+        assert(topic && handler, "Missing args");
         await this.advertise({ name: "#" + topic }, (msg) => handler(msg.payload));
     }
     async unsubscribe(topic) {
-        (0, assert_1.default)(topic, "Missing args");
+        assert(topic, "Missing args");
         await this.unadvertise("#" + topic);
     }
     async status() {
@@ -392,4 +363,3 @@ class ServiceBroker {
         this.shutdown$.next();
     }
 }
-exports.ServiceBroker = ServiceBroker;

@@ -1,21 +1,16 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const assert_1 = __importDefault(require("assert"));
-const dotenv_1 = __importDefault(require("dotenv"));
-const index_1 = require("./index");
-const test_utils_1 = require("./test-utils");
-dotenv_1.default.config();
-(0, assert_1.default)(process.env.SERVICE_BROKER_URL, "Missing env SERVICE_BROKER_URL");
-const sb = new index_1.ServiceBroker({ url: process.env.SERVICE_BROKER_URL });
-(0, test_utils_1.describe)("main", ({ test }) => {
+import assert from "assert";
+import dotenv from "dotenv";
+import { ServiceBroker } from "./index.js";
+import { describe, expect, runAll } from "./test-utils.js";
+dotenv.config();
+assert(process.env.SERVICE_BROKER_URL, "Missing env SERVICE_BROKER_URL");
+const sb = new ServiceBroker({ url: process.env.SERVICE_BROKER_URL });
+describe("main", ({ test }) => {
     test("pub/sub", async () => {
         const queue = new Queue();
         sb.subscribe("test-log", msg => queue.push(msg));
         sb.publish("test-log", "what in the world");
-        (0, test_utils_1.expect)(await queue.shift()).toBe("what in the world");
+        expect(await queue.shift()).toBe("what in the world");
     });
     test("request/response", async () => {
         const queue = new Queue();
@@ -119,7 +114,7 @@ const sb = new index_1.ServiceBroker({ url: process.env.SERVICE_BROKER_URL });
             });
         }
         catch (err) {
-            (0, test_utils_1.expect)(err.message).toBe("NO_PROVIDER test-tts");
+            expect(err.message).toBe("NO_PROVIDER test-tts");
         }
     });
 });
@@ -141,16 +136,16 @@ class Queue {
     }
 }
 function expectMessage(a, b, opts) {
-    (0, assert_1.default)(typeof a == "object" && a);
-    (0, assert_1.default)(typeof a.header == "object" && a.header);
-    (0, assert_1.default)(typeof a.header.from == "string");
-    (0, assert_1.default)(typeof a.header.to == (opts.to ? "string" : "undefined"));
-    (0, assert_1.default)(typeof a.header.ip == (opts.ip ? "string" : "undefined"));
-    (0, assert_1.default)(typeof a.header.id == (opts.id ? "string" : "undefined"));
+    assert(typeof a == "object" && a);
+    assert(typeof a.header == "object" && a.header);
+    assert(typeof a.header.from == "string");
+    assert(typeof a.header.to == (opts.to ? "string" : "undefined"));
+    assert(typeof a.header.ip == (opts.ip ? "string" : "undefined"));
+    assert(typeof a.header.id == (opts.id ? "string" : "undefined"));
     for (const p in b.header)
-        (0, test_utils_1.expect)(a.header[p]).toEqual(b.header[p]);
-    (0, test_utils_1.expect)(a.payload).toEqual(b.payload);
+        expect(a.header[p]).toEqual(b.header[p]);
+    expect(a.payload).toEqual(b.payload);
 }
-(0, test_utils_1.runAll)()
+runAll()
     .catch(console.error)
     .finally(() => sb.shutdown());

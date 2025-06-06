@@ -24,11 +24,11 @@ export declare class ServiceBroker {
     private readonly shutdown$;
     constructor(opts: {
         url: string;
-        logger?: Logger;
-        keepAliveIntervalSeconds?: number;
-        onConnect?: () => void;
         authToken?: string;
-        disableReconnect?: boolean;
+        onConnect?: () => void;
+        disableAutoReconnect?: boolean;
+        keepAliveIntervalSeconds?: number;
+        logger?: Logger;
     });
     private onMessage;
     private onServiceRequest;

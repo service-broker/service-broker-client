@@ -1,7 +1,7 @@
 import assert from "assert";
 import * as rxjs from "rxjs";
 import { PassThrough, Readable, Transform } from "stream";
-import { connect, Connection } from "./websocket";
+import { connect, Connection } from "./websocket.js";
 
 
 export interface Message {
@@ -64,11 +64,11 @@ export class ServiceBroker {
 
   constructor(private opts: {
     url: string,
-    logger?: Logger,
-    keepAliveIntervalSeconds?: number,
-    onConnect?: () => void,
     authToken?: string,
-    disableReconnect?: boolean,
+    onConnect?: () => void,
+    disableAutoReconnect?: boolean,
+    keepAliveIntervalSeconds?: number,
+    logger?: Logger,
   }) {
     this.providers = {};
     this.pending = {};
@@ -82,7 +82,7 @@ export class ServiceBroker {
           this.logger.info("Failed to connect to service broker,", String(err))
         }
       }),
-      opts.disableReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }),
+      opts.disableAutoReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }),
       rxjs.exhaustMap(conn => {
         this.logger.info("Service broker connection established");
         conn.send(
@@ -127,7 +127,7 @@ export class ServiceBroker {
           rxjs.finalize(() => conn.close())
         )
       }),
-      opts.disableReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }),
+      opts.disableAutoReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }),
       rxjs.takeUntil(this.shutdown$),
       rxjs.shareReplay(1)
     )

@@ -1,7 +1,7 @@
 import assert from "assert"
 import dotenv from "dotenv"
-import { ServiceBroker } from "./index"
-import { describe, expect, runAll } from "./test-utils"
+import { ServiceBroker } from "./index.js"
+import { describe, expect, runAll } from "./test-utils.js"
 
 dotenv.config()
 
