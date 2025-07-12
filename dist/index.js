@@ -1,7 +1,7 @@
+import { connect } from "@service-broker/websocket";
 import assert from "assert";
 import * as rxjs from "rxjs";
 import { PassThrough, Transform } from "stream";
-import { connect } from "./websocket.js";
 const reservedFields = {
     from: undefined,
     to: undefined,
@@ -50,11 +50,12 @@ export class ServiceBroker {
                 catch (err) {
                     this.logger.error(err);
                 }
-            })), conn.error$.pipe(rxjs.tap(event => this.logger.error(event.error)))).pipe(rxjs.ignoreElements(), rxjs.startWith(conn), rxjs.endWith(null), rxjs.takeUntil(rxjs.merge(conn.close$.pipe(rxjs.tap(event => this.logger.info("Service broker connection lost,", event.code, event.reason))), conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(rxjs.catchError(err => {
-                if (!(err instanceof rxjs.TimeoutError))
-                    this.logger.error(err);
-                this.logger.info("Service broker connection lost, keep-alive timeout");
-                return rxjs.of(0);
+            })), conn.error$.pipe(rxjs.tap(event => this.logger.error(event.error))), conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(rxjs.catchError(err => {
+                this.logger.info("Pong timeout,", err.message);
+                conn.terminate();
+                return rxjs.EMPTY;
+            }))).pipe(rxjs.ignoreElements(), rxjs.startWith(conn), rxjs.endWith(null), rxjs.takeUntil(rxjs.merge(conn.close$.pipe(rxjs.tap(event => {
+                this.logger.info("Service broker connection lost,", event.code, event.reason);
             })))), rxjs.finalize(() => conn.close()));
         }), opts.disableAutoReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
     }
@@ -363,3 +364,4 @@ export class ServiceBroker {
         this.shutdown$.next();
     }
 }
+//# sourceMappingURL=index.js.map

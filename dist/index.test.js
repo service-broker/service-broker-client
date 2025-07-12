@@ -1,16 +1,25 @@
+import { describe, expect } from "@service-broker/test-utils";
 import assert from "assert";
 import dotenv from "dotenv";
 import { ServiceBroker } from "./index.js";
-import { describe, expect, runAll } from "./test-utils.js";
 dotenv.config();
 assert(process.env.SERVICE_BROKER_URL, "Missing env SERVICE_BROKER_URL");
-const sb = new ServiceBroker({ url: process.env.SERVICE_BROKER_URL });
-describe("main", ({ test }) => {
+const serviceBrokerUrl = process.env.SERVICE_BROKER_URL;
+assert(process.env.AUTH_TOKEN, "Missing env AUTH_TOKEN");
+const authToken = process.env.AUTH_TOKEN;
+describe("main", ({ beforeAll, afterAll, test }) => {
+    let sb;
+    beforeAll(() => {
+        sb = new ServiceBroker({ url: serviceBrokerUrl, authToken });
+    });
+    afterAll(() => {
+        sb.shutdown();
+    });
     test("pub/sub", async () => {
         const queue = new Queue();
         sb.subscribe("test-log", msg => queue.push(msg));
         sb.publish("test-log", "what in the world");
-        expect(await queue.shift()).toBe("what in the world");
+        expect(await queue.shift(), "what in the world");
     });
     test("request/response", async () => {
         const queue = new Queue();
@@ -114,7 +123,7 @@ describe("main", ({ test }) => {
             });
         }
         catch (err) {
-            expect(err.message).toBe("NO_PROVIDER test-tts");
+            expect(err.message, "NO_PROVIDER test-tts");
         }
     });
 });
@@ -143,9 +152,7 @@ function expectMessage(a, b, opts) {
     assert(typeof a.header.ip == (opts.ip ? "string" : "undefined"));
     assert(typeof a.header.id == (opts.id ? "string" : "undefined"));
     for (const p in b.header)
-        expect(a.header[p]).toEqual(b.header[p]);
-    expect(a.payload).toEqual(b.payload);
+        expect(a.header[p], b.header[p]);
+    expect(a.payload, b.payload);
 }
-runAll()
-    .catch(console.error)
-    .finally(() => sb.shutdown());
+//# sourceMappingURL=index.test.js.map

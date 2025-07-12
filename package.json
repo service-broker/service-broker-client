@@ -1,6 +1,6 @@
 {
   "name": "@service-broker/client-node",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Node ESM client library for interacting with a service broker",
   "type": "module",
   "main": "dist/index.js",
@@ -19,13 +19,12 @@
   },
   "homepage": "https://github.com/service-broker/service-broker-client#readme",
   "devDependencies": {
+    "@service-broker/test-utils": "^1.0.3",
     "@types/node": "^22.5.4",
     "dotenv": "^16.4.5",
     "typescript": "^5.6.2"
   },
   "dependencies": {
-    "@types/ws": "^8.5.12",
-    "rxjs": "^7.8.2",
-    "ws": "^8.18.0"
+    "@service-broker/websocket": "^1.0.2"
   }
 }

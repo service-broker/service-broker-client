@@ -1,7 +1,7 @@
+import { connect, Connection } from "@service-broker/websocket";
 import assert from "assert";
 import * as rxjs from "rxjs";
 import { PassThrough, Readable, Transform } from "stream";
-import { connect, Connection } from "./websocket.js";
 
 
 export interface Message {
@@ -105,6 +105,13 @@ export class ServiceBroker {
           ),
           conn.error$.pipe(
             rxjs.tap(event => this.logger.error(event.error))
+          ),
+          conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(
+            rxjs.catchError(err => {
+              this.logger.info("Pong timeout,", err.message)
+              conn.terminate()
+              return rxjs.EMPTY
+            })
           )
         ).pipe(
           rxjs.ignoreElements(),
@@ -113,13 +120,8 @@ export class ServiceBroker {
           rxjs.takeUntil(
             rxjs.merge(
               conn.close$.pipe(
-                rxjs.tap(event => this.logger.info("Service broker connection lost,", event.code, event.reason))
-              ),
-              conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(
-                rxjs.catchError(err => {
-                  if (!(err instanceof rxjs.TimeoutError)) this.logger.error(err)
-                  this.logger.info("Service broker connection lost, keep-alive timeout")
-                  return rxjs.of(0)
+                rxjs.tap(event => {
+                  this.logger.info("Service broker connection lost,", event.code, event.reason)
                 })
               )
             )
