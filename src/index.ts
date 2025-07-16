@@ -1,33 +1,35 @@
-import { connect, Connection } from "@service-broker/websocket";
+import { Connection, connect as connectWebSocket } from "@service-broker/websocket";
 import assert from "assert";
 import * as rxjs from "rxjs";
-import { PassThrough, Readable, Transform } from "stream";
+import { PassThrough, Readable } from "stream";
+import WebSocket from "ws";
+import { deserialize, serialize } from "./serialize.js";
 
 
 export interface Message {
-  header?: {[key: string]: any};
-  payload?: string|Buffer|Readable;
+  header?: Record<string, unknown>
+  payload?: string | Buffer | Readable;
 }
 
 export interface MessageWithHeader extends Message {
-  header: {[key: string]: any};
+  header: Record<string, unknown>
 }
 
-type Provider = {
-  service: {
-    name: string;
-    capabilities?: string[];
-    priority?: number;
-  };
-  handler: (msg: MessageWithHeader) => Message|void|Promise<Message|void>;
-  advertise: boolean;
-};
+export type ServiceBroker = ReturnType<typeof makeClient>
 
-type PendingResponse = {
-  process: (msg: MessageWithHeader) => void;
-};
+interface ProvidedService {
+  name: string
+  capabilities?: string[]
+  priority?: number
+}
 
-const reservedFields: {[key: string]: void} = {
+interface Provider {
+  service: ProvidedService
+  handler(req: MessageWithHeader): Message | void | Promise<Message | void>
+  advertise: boolean
+}
+
+const reservedFields: Record<string, void> = {
   from: undefined,
   to: undefined,
   id: undefined,
@@ -37,418 +39,476 @@ const reservedFields: {[key: string]: void} = {
   part: undefined
 };
 
-interface Logger {
-  info: Console["info"],
-  error: Console["error"]
+function* makeIdGen(): Generator<string, never> {
+  let i = 0
+  while (true) yield String(++i)
 }
 
-function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
-  if (millis == Infinity) return promise
-  let timer: NodeJS.Timeout
-  return Promise.race([
-    promise
-      .finally(() => clearTimeout(timer)),
-    new Promise(f => timer = setTimeout(f, millis))
-      .then(() => Promise.reject(new Error("Timeout")))
-  ])
+function assertRecord(value: object): asserts value is Record<string, unknown> {
 }
 
 
-export class ServiceBroker {
-  private readonly connection$: rxjs.Observable<Connection | null>
-  private readonly providers: {[key: string]: Provider};
-  private readonly pending: {[key: string]: PendingResponse};
-  private pendingIdGen: number;
-  private logger: Logger;
-  private readonly shutdown$: rxjs.Subject<void>
 
-  constructor(private opts: {
-    url: string,
-    authToken?: string,
-    onConnect?: () => void,
-    disableAutoReconnect?: boolean,
-    keepAliveIntervalSeconds?: number,
-    logger?: Logger,
-  }) {
-    this.providers = {};
-    this.pending = {};
-    this.pendingIdGen = 0;
-    this.logger = opts.logger ?? console
-    this.shutdown$ = new rxjs.ReplaySubject(1)
+export interface ConnectOptions {
+  authToken?: string
+  keepAlive?: {
+    pingInterval: number
+    pongTimeout: number
+  },
+  streamingChunkSize?: number
+}
 
-    this.connection$ = connect(opts.url).pipe(
-      rxjs.tap({
-        error: err => {
-          this.logger.info("Failed to connect to service broker,", String(err))
-        }
-      }),
-      opts.disableAutoReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }),
-      rxjs.exhaustMap(conn => {
-        this.logger.info("Service broker connection established");
-        conn.send(
-          JSON.stringify({
-            authToken: this.opts.authToken,
-            type: "SbAdvertiseRequest",
-            services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-          })
+type ErrorEvent = {
+  type: 'send-error'
+  message?: MessageWithHeader
+  error: unknown
+} | {
+  type: 'receive-error'
+  message: WebSocket.Data
+  error: unknown
+} | {
+  type: 'keep-alive-error'
+  error: unknown
+} | {
+  type: 'socket-error'
+  error: unknown
+}
+
+export function connect(url: string, opts: ConnectOptions = {}) {
+  const providers = new Map<string, Provider>()
+  const waitEndpoints = new Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>()
+  return connectWebSocket(url).pipe(
+    rxjs.map(con => makeClient(con, providers, waitEndpoints, opts))
+  )
+}
+
+function makeClient(
+  con: Connection,
+  providers: Map<string, Provider>,
+  waitEndpoints: Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>,
+  { authToken, keepAlive, streamingChunkSize }: ConnectOptions
+) {
+  const transmit = rxjs.bindNodeCallback(con.send).bind(con)
+  const sendSubject = new rxjs.Subject<{ msg: MessageWithHeader, subscriber: rxjs.Subscriber<void> }>()
+  const pendingIdGen = makeIdGen()
+  const pendingResponses = new Map<string, rxjs.Subscriber<MessageWithHeader>>()
+
+  return {
+    event$: rxjs.merge<ErrorEvent[]>(
+      //WARNING: this must come before the others!
+      sendSubject.pipe(
+        rxjs.concatMap(({ msg, subscriber }) =>
+          rxjs.defer(() => {
+            const data = serialize(msg, streamingChunkSize)
+            if (rxjs.isObservable(data)) {
+              return data.pipe(
+                rxjs.concatMap(chunk => transmit(chunk, {})),
+                rxjs.ignoreElements(),
+                rxjs.endWith(undefined)
+              )
+            } else {
+              return transmit(data, {})
+            }
+          }).pipe(
+            rxjs.tap(subscriber),
+            rxjs.ignoreElements(),
+            rxjs.catchError(err =>
+              rxjs.of<ErrorEvent>({
+                type: 'send-error',
+                message: msg,
+                error: err
+              })
+            )
+          )
         )
-        this.opts.onConnect?.()
-        return rxjs.merge(
-          conn.message$.pipe(
-            rxjs.tap(event => {
-              try {
-                this.onMessage(event.data)
-              } catch (err) {
-                this.logger.error(err)
+      ),
+      //readvertise services on reconnect
+      rxjs.defer(() => {
+        const services = Array.from(providers.values())
+          .filter(x => x.advertise)
+          .map(x => x.service)
+        return rxjs.iif(
+          () => services.length > 0,
+          sendAdvertisement(services).pipe(
+            rxjs.ignoreElements(),
+            rxjs.catchError(err =>
+              rxjs.of<ErrorEvent>({
+                type: 'send-error',
+                message: { header: { type: 'SbAdvertiseRequest', services } },
+                error: err
+              })
+            )
+          ),
+          rxjs.EMPTY
+        )
+      }),
+      //resend endpointWaitRequests on reconnect
+      rxjs.defer(() =>
+        rxjs.from(waitEndpoints.keys()).pipe(
+          rxjs.concatMap(endpointId =>
+            send({
+              header: {
+                type: "SbEndpointWaitRequest",
+                endpointId
               }
             })
           ),
-          conn.error$.pipe(
-            rxjs.tap(event => this.logger.error(event.error))
-          ),
-          conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(
-            rxjs.catchError(err => {
-              this.logger.info("Pong timeout,", err.message)
-              conn.terminate()
-              return rxjs.EMPTY
+          rxjs.ignoreElements(),
+          rxjs.catchError(err =>
+            rxjs.of<ErrorEvent>({
+              type: 'send-error',
+              message: { header: { type: 'SbEndpointWaitRequest' } },
+              error: err
             })
           )
-        ).pipe(
-          rxjs.ignoreElements(),
-          rxjs.startWith(conn),
-          rxjs.endWith(null),
-          rxjs.takeUntil(
-            rxjs.merge(
-              conn.close$.pipe(
-                rxjs.tap(event => {
-                  this.logger.info("Service broker connection lost,", event.code, event.reason)
-                })
-              )
-            )
-          ),
-          rxjs.finalize(() => conn.close())
         )
-      }),
-      opts.disableAutoReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }),
-      rxjs.takeUntil(this.shutdown$),
-      rxjs.shareReplay(1)
+      ),
+      con.message$.pipe(
+        rxjs.mergeMap(event =>
+          processMessage(event.data).pipe(
+            rxjs.ignoreElements(),
+            rxjs.catchError(err =>
+              rxjs.of<ErrorEvent>({
+                type: 'receive-error',
+                message: event.data,
+                error: err
+              })
+            )
+          )
+        )
+      ),
+      con.error$.pipe(
+        rxjs.map(event => ({
+          type: 'socket-error',
+          error: event.error
+        }))
+      ),
+      !keepAlive
+        ? rxjs.EMPTY
+        : con.keepAlive(keepAlive.pingInterval, keepAlive.pongTimeout).pipe(
+          rxjs.ignoreElements(),
+          rxjs.catchError(err => {
+            con.terminate()
+            return rxjs.of<ErrorEvent>({
+              type: 'keep-alive-error',
+              error: err
+            })
+          })
+        )
+    ),
+
+    close$: con.close$,
+    close: con.close.bind(con),
+    debug: {
+      con
+    },
+
+    advertise(
+      service: { name: string, capabilities?: string[], priority?: number },
+      handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>
+    ) {
+      assert(!providers.has(service.name), `${service.name} provider already exists`)
+      return sendAdvertisement(
+        Array.from(providers.values())
+          .filter(x => x.advertise)
+          .map(x => x.service)
+          .concat(service)
+      ).pipe(
+        rxjs.tap(() => {
+          providers.set(service.name, {
+            service,
+            handler,
+            advertise: true
+          })
+        })
+      )
+    },
+
+    unadvertise(serviceName: string) {
+      assert(providers.has(serviceName), `${serviceName} provider not exists`)
+      return sendAdvertisement(
+        Array.from(providers.values())
+          .filter(x => x.advertise && x.service.name != serviceName)
+          .map(x => x.service)
+      ).pipe(
+        rxjs.tap(() => {
+          providers.delete(serviceName)
+        })
+      )
+    },
+
+    setServiceHandler(
+      serviceName: string,
+      handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>
+    ) {
+      assert(!providers.has(serviceName), `${serviceName} provider already exists`)
+      providers.set(serviceName, {
+        service: { name: serviceName },
+        handler,
+        advertise: false
+      })
+    },
+
+    request(
+      service: { name: string, capabilities?: string[] },
+      req: Message,
+      timeout?: number
+    ) {
+      return sendReq({
+        header: {
+          ...req.header,
+          ...reservedFields,
+          type: "ServiceRequest",
+          service
+        },
+        payload: req.payload
+      }, timeout)
+    },
+
+    notify(
+      service: { name: string, capabilities?: string[] },
+      msg: Message
+    ) {
+      return send({
+        header: {
+          ...msg.header,
+          ...reservedFields,
+          type: "ServiceRequest",
+          service
+        },
+        payload: msg.payload
+      })
+    },
+
+    requestTo(
+      endpointId: string,
+      serviceName: string,
+      req: Message,
+      timeout?: number
+    ) {
+      return sendReq({
+        header: {
+          ...req.header,
+          ...reservedFields,
+          to: endpointId,
+          type: "ServiceRequest",
+          service: { name: serviceName }
+        },
+        payload: req.payload
+      }, timeout)
+    },
+
+    notifyTo(
+      endpointId: string,
+      serviceName: string,
+      msg: Message
+    ) {
+      return send({
+        header: {
+          ...msg.header,
+          ...reservedFields,
+          to: endpointId,
+          type: "ServiceRequest",
+          service: { name: serviceName }
+        },
+        payload: msg.payload
+      })
+    },
+
+    publish(topic: string, text: string) {
+      return send({
+        header: {
+          type: "ServiceRequest",
+          service: { name: "#" + topic }
+        },
+        payload: text
+      })
+    },
+
+    subscribe(topic: string, handler: (text: string) => void) {
+      return this.advertise(
+        { name: "#" + topic },
+        msg => handler(msg.payload as string)
+      )
+    },
+
+    unsubscribe(topic: string) {
+      return this.unadvertise("#" + topic)
+    },
+
+    status() {
+      return sendReq({
+        header: { type: "SbStatusRequest" }
+      }).pipe(
+        rxjs.map(res => JSON.parse(res.payload as string))
+      )
+    },
+
+    cleanup() {
+      return send({
+        header: {
+          type: "SbCleanupRequest"
+        }
+      })
+    },
+
+    waitEndpoint(endpointId: string) {
+      let waiter = waitEndpoints.get(endpointId)
+      if (!waiter) {
+        const closeSubject = new rxjs.ReplaySubject<void>()
+        waitEndpoints.set(endpointId, waiter = {
+          closeSubject,
+          close$: send({
+            header: {
+              type: "SbEndpointWaitRequest",
+              endpointId
+            }
+          }).pipe(
+            rxjs.exhaustMap(() => closeSubject),
+            rxjs.finalize(() => waitEndpoints.delete(endpointId))
+          )
+        })
+      }
+      return waiter.close$
+    }
+  }
+
+
+
+  function sendAdvertisement(services: ProvidedService[]) {
+    return sendReq({
+      header: {
+        authToken,
+        type: "SbAdvertiseRequest"
+      },
+      payload: JSON.stringify(services)
+    })
+  }
+
+  function processMessage(data: unknown): rxjs.Observable<void> {
+    const msg = deserialize(data)
+    if (msg.header.type == "ServiceRequest") return onServiceRequest(msg)
+    else if (msg.header.type == "ServiceResponse") return onServiceResponse(msg)
+    else if (msg.header.type == "SbAdvertiseResponse") return onServiceResponse(msg)
+    else if (msg.header.type == "SbStatusResponse") return onServiceResponse(msg)
+    else if (msg.header.type == "SbEndpointWaitResponse") return onEndpointWaitResponse(msg)
+    else if (msg.header.error) return onServiceResponse(msg)
+    else if (msg.header.service) return onServiceRequest(msg)
+    else throw new Error("Don't know what to do with message")
+  }
+
+  function onServiceRequest(req: MessageWithHeader): rxjs.Observable<void> {
+    return rxjs.defer(() => {
+      assert(typeof req.header.service == 'object' && req.header.service != null, 'BAD_REQUEST')
+      assertRecord(req.header.service)
+      assert(typeof req.header.service.name == 'string', 'BAD_REQUEST')
+      const provider = providers.get(req.header.service.name)
+      assert(provider, "NO_PROVIDER " + req.header.service.name)
+      return Promise.resolve(provider.handler(req))
+    }).pipe(
+      rxjs.map(res => res ?? {}),
+      rxjs.exhaustMap(res =>
+        rxjs.iif(
+          () => req.header.id != null,
+          send({
+            header: {
+              ...res.header,
+              ...reservedFields,
+              to: req.header.from,
+              id: req.header.id,
+              type: "ServiceResponse"
+            },
+            payload: res.payload
+          }),
+          rxjs.EMPTY
+        )
+      ),
+      rxjs.catchError(err =>
+        rxjs.iif(
+          () => req.header.id != null,
+          send({
+            header: {
+              to: req.header.from,
+              id: req.header.id,
+              type: "ServiceResponse",
+              error: err instanceof Error ? err.message : String(err)
+            }
+          }),
+          rxjs.throwError(() =>
+            new Error('Potentially silent error thrown by notification handler', { cause: err })
+          )
+        )
+      )
     )
   }
 
-  private onMessage(data: unknown) {
-    let msg: MessageWithHeader;
-    try {
-      if (typeof data == "string") msg = this.messageFromString(data);
-      else if (Buffer.isBuffer(data)) msg = this.messageFromBuffer(data);
-      else throw new Error("Message is not a string or Buffer");
-    }
-    catch (err) {
-      this.logger.error(String(err));
-      return;
-    }
-    if (msg.header.type == "ServiceRequest") this.onServiceRequest(msg);
-    else if (msg.header.type == "ServiceResponse") this.onServiceResponse(msg);
-    else if (msg.header.type == "SbStatusResponse") this.onServiceResponse(msg);
-    else if (msg.header.type == "SbEndpointWaitResponse") this.onServiceResponse(msg);
-    else if (msg.header.error) this.onServiceResponse(msg);
-    else if (msg.header.service) this.onServiceRequest(msg);
-    else this.logger.error("Don't know what to do with message:", msg.header);
-  }
-
-  private async onServiceRequest(msg: MessageWithHeader) {
-    try {
-      if (this.providers[msg.header.service.name]) {
-        const res = await this.providers[msg.header.service.name].handler(msg) || {};
-        if (msg.header.id) {
-          const header = {
-            to: msg.header.from,
-            id: msg.header.id,
-            type: "ServiceResponse"
-          };
-          await this.send(Object.assign({}, res.header, reservedFields, header), res.payload);
-        }
-      }
-      else throw new Error("No provider for service " + msg.header.service.name);
-    }
-    catch (err) {
-      if (msg.header.id) {
-        await this.send({
-          to: msg.header.from,
-          id: msg.header.id,
-          type: "ServiceResponse",
-          error: err instanceof Error ? err.message : String(err)
-        });
-      }
-      else this.logger.error(String(err), msg.header);
+  function onServiceResponse(msg: MessageWithHeader): rxjs.Observable<void> {
+    const pending = pendingResponses.get(msg.header.id as string)
+    if (pending) {
+      pending.next(msg)
+      return rxjs.EMPTY
+    } else {
+      throw new Error("Response received but no pending request")
     }
   }
 
-  private onServiceResponse(msg: MessageWithHeader) {
-    if (this.pending[msg.header.id]) this.pending[msg.header.id].process(msg);
-    else this.logger.error("Response received but no pending request:", msg.header);
-  }
-
-  private messageFromString(str: string): MessageWithHeader {
-    if (str[0] != "{") throw new Error("Message doesn't have JSON header");
-    const index = str.indexOf("\n");
-    const headerStr = (index != -1) ? str.slice(0,index) : str;
-    const payload = (index != -1) ? str.slice(index+1) : undefined;
-    let header;
-    try {
-      header = JSON.parse(headerStr);
+  function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<void> {
+    const waiter = waitEndpoints.get(msg.header.endpointId as string)
+    if (waiter) {
+      waiter.closeSubject.next()
+      waiter.closeSubject.complete()
+      return rxjs.EMPTY
+    } else {
+      throw new Error("Stray EndpointWaitResponse")
     }
-    catch (err) {
-      throw new Error("Failed to parse message header");
-    }
-    return {header, payload};
   }
 
-  private messageFromBuffer(buf: Buffer): MessageWithHeader {
-    if (buf[0] != 123) throw new Error("Message doesn't have JSON header");
-    const index = buf.indexOf("\n");
-    const headerStr = (index != -1) ? buf.slice(0,index).toString() : buf.toString();
-    const payload = (index != -1) ? buf.slice(index+1) : undefined;
-    let header;
-    try {
-      header = JSON.parse(headerStr);
-    }
-    catch (err) {
-      throw new Error("Failed to parse message header");
-    }
-    return {header, payload};
-  }
-
-  private async send(header: {[key: string]: any}, payload?: string|Buffer|Readable) {
-    const ws = await rxjs.firstValueFrom(this.connection$)
-    if (!ws) throw new Error("No connection")
-    const headerStr = JSON.stringify(header);
-    if (payload) {
-      if (typeof payload == "string") {
-        ws.send(headerStr + "\n" + payload);
-      }
-      else if (Buffer.isBuffer(payload)) {
-        const headerLen = Buffer.byteLength(headerStr);
-        const tmp = Buffer.allocUnsafe(headerLen +1 +payload.length);
-        tmp.write(headerStr);
-        tmp[headerLen] = 10;
-        payload.copy(tmp, headerLen+1);
-        ws.send(tmp);
-      }
-      else if (payload.pipe) {
-        const stream = this.packetizer(64*1000);
-        stream.on("data", data => this.send(Object.assign({}, header, {part: true}), data));
-        stream.on("end", () => this.send(header));
-        payload.pipe(stream);
-      }
-      else throw new Error("Unexpected");
-    }
-    else ws.send(headerStr);
-  }
-
-  private packetizer(size: number): Transform {
-    let buf: Buffer|null;
-    let pos: number;
-    return new Transform({
-      transform: function(chunk: Buffer, encoding, callback) {
-        while (chunk.length) {
-          if (!buf) {
-            buf = Buffer.alloc(size);
-            pos = 0;
-          }
-          const count = chunk.copy(buf, pos);
-          pos += count;
-          if (pos >= buf.length) {
-            this.push(buf);
-            buf = null;
-          }
-          chunk = chunk.slice(count);
-        }
-        callback();
-      },
-      flush: function(callback) {
-        if (buf) {
-          this.push(buf.slice(0, pos));
-          buf = null;
-        }
-        callback();
-      }
-    });
-  }
-
-
-
-
-  async advertise(service: {name: string, capabilities?: string[], priority?: number}, handler: (msg: MessageWithHeader) => Message|void|Promise<Message|void>) {
-    assert(service && service.name && handler, "Missing args");
-    assert(!this.providers[service.name], `${service.name} provider already exists`);
-    this.providers[service.name] = {
-      service,
-      handler,
-      advertise: true
-    };
-    await this.send({
-      authToken: this.opts.authToken,
-      type: "SbAdvertiseRequest",
-      services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-    });
-  }
-
-  async unadvertise(serviceName: string) {
-    assert(serviceName, "Missing args");
-    assert(this.providers[serviceName], `${serviceName} provider not exists`);
-    delete this.providers[serviceName];
-    await this.send({
-      authToken: this.opts.authToken,
-      type: "SbAdvertiseRequest",
-      services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-    });
-  }
-
-  setServiceHandler(serviceName: string, handler: (msg: MessageWithHeader) => Message|void|Promise<Message|void>) {
-    assert(serviceName && handler, "Missing args");
-    assert(!this.providers[serviceName], `${serviceName} provider already exists`);
-    this.providers[serviceName] = {
-      service: {name: serviceName},
-      handler,
-      advertise: false
-    };
-  }
-
-
-
-  async request(service: {name: string, capabilities?: string[]}, req: Message, timeout?: number): Promise<Message> {
-    assert(service && service.name && req, "Missing args");
-    const id = String(++this.pendingIdGen);
-    const promise = this.pendingResponse(id, timeout);
-    const header = {
-      id,
-      type: "ServiceRequest",
-      service
-    };
-    await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-    return promise;
-  }
-
-  async notify(service: {name: string, capabilities?: string[]}, msg: Message): Promise<void> {
-    assert(service && service.name && msg, "Missing args");
-    const header = {
-      type: "ServiceRequest",
-      service
-    };
-    await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
-  }
-
-  async requestTo(endpointId: string, serviceName: string, req: Message, timeout?: number): Promise<Message> {
-    assert(endpointId && serviceName && req, "Missing args");
-    const id = String(++this.pendingIdGen);
-    const promise = this.pendingResponse(id, timeout);
-    const header = {
-      to: endpointId,
-      id,
-      type: "ServiceRequest",
-      service: {name: serviceName}
-    }
-    await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-    return promise;
-  }
-
-  async notifyTo(endpointId: string, serviceName: string, msg: Message): Promise<void> {
-    assert(endpointId && serviceName && msg, "Missing args");
-    const header = {
-      to: endpointId,
-      type: "ServiceRequest",
-      service: {name: serviceName}
-    }
-    await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
-  }
-
-  private pendingResponse(id: string, timeout?: number): Promise<Message> {
-    const promise: Promise<Message> = new Promise((fulfill, reject) => {
-      let stream: PassThrough;
-      this.pending[id] = {
-        process: res => {
-          if (res.header.error) reject(new Error(res.header.error));
-          else {
-            if (res.header.part) {
-              if (!stream) fulfill({header: res.header, payload: stream = new PassThrough()});
-              stream.write(res.payload);
-            }
-            else {
-              delete this.pending[id];
-              if (stream) stream.end(res.payload);
-              else fulfill(res);
-            }
-          }
-        }
-      };
-    });
-    return pTimeout(promise, timeout || 30*1000)
-      .catch(err => {
-        delete this.pending[id];
-        throw err;
-      });
-  }
-
-
-
-
-  async publish(topic: string, text: string) {
-    assert(topic && text, "Missing args");
-    await this.send({
-      type: "ServiceRequest",
-      service: {name: "#"+topic}
-    },
-    text);
-  }
-
-  async subscribe(topic: string, handler: (text: string) => void) {
-    assert(topic && handler, "Missing args");
-    await this.advertise({name: "#"+topic}, (msg: Message) => handler(msg.payload as string));
-  }
-
-  async unsubscribe(topic: string) {
-    assert(topic, "Missing args");
-    await this.unadvertise("#"+topic);
-  }
-
-
-
-
-  async status() {
-    const id = String(++this.pendingIdGen);
-    await this.send({
-      id,
-      type: "SbStatusRequest"
-    })
-    const res = await this.pendingResponse(id);
-    return JSON.parse(res.payload as string);
-  }
-
-  async cleanup() {
-    await this.send({
-      type: "SbCleanupRequest"
+  function send(msg: MessageWithHeader): rxjs.Observable<void> {
+    return new rxjs.Observable(subscriber => {
+      sendSubject.next({ msg, subscriber })
     })
   }
 
-  private readonly waitPromises = new Map<string, Promise<void>>()
-
-  private async wait(endpointId: string) {
-    const id = String(++this.pendingIdGen);
-    await this.send({
-      id,
-      type: "SbEndpointWaitRequest",
-      endpointId
+  function sendReq(msg: MessageWithHeader, timeout = 30000): rxjs.Observable<MessageWithHeader> {
+    return rxjs.defer(() => {
+      const id = pendingIdGen.next().value
+      msg.header.id = id
+      return send(msg).pipe(
+        rxjs.exhaustMap(() =>
+          new rxjs.Observable<MessageWithHeader>(subscriber => {
+            pendingResponses.set(id, subscriber)
+            return () => pendingResponses.delete(id)
+          })
+        ),
+        rxjs.share(),
+        src$ => src$.pipe(
+          rxjs.first(),
+          timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout),
+          rxjs.exhaustMap(res =>
+            rxjs.iif(
+              () => !!res.header.part,
+              rxjs.defer(() => {
+                const stream = new PassThrough()
+                const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream)
+                return src$.pipe(
+                  rxjs.startWith(res),
+                  rxjs.takeWhile(msg => !!msg.header.part, true),
+                  rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY),
+                  rxjs.finalize(() => stream.end()),
+                  rxjs.ignoreElements(),
+                  rxjs.startWith({ header: res.header, payload: stream })
+                )
+              }),
+              rxjs.iif(
+                () => !!res.header.error,
+                rxjs.throwError(() => typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error),
+                rxjs.of(res)
+              )
+            )
+          ),
+          rxjs.share({ resetOnRefCountZero: false })
+        )
+      )
     })
-    await this.pendingResponse(id, Infinity);
-  }
-
-  waitEndpoint(endpointId: string) {
-    let promise = this.waitPromises.get(endpointId)
-    if (!promise) this.waitPromises.set(endpointId, promise = this.wait(endpointId).finally(() => this.waitPromises.delete(endpointId)))
-    return promise
-  }
-
-  shutdown() {
-    this.shutdown$.next()
   }
 }

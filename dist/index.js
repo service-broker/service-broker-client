@@ -1,7 +1,8 @@
-import { connect } from "@service-broker/websocket";
+import { connect as connectWebSocket } from "@service-broker/websocket";
 import assert from "assert";
 import * as rxjs from "rxjs";
-import { PassThrough, Transform } from "stream";
+import { PassThrough } from "stream";
+import { deserialize, serialize } from "./serialize.js";
 const reservedFields = {
     from: undefined,
     to: undefined,
@@ -11,357 +12,293 @@ const reservedFields = {
     service: undefined,
     part: undefined
 };
-function pTimeout(promise, millis) {
-    if (millis == Infinity)
-        return promise;
-    let timer;
-    return Promise.race([
-        promise
-            .finally(() => clearTimeout(timer)),
-        new Promise(f => timer = setTimeout(f, millis))
-            .then(() => Promise.reject(new Error("Timeout")))
-    ]);
+function* makeIdGen() {
+    let i = 0;
+    while (true)
+        yield String(++i);
 }
-export class ServiceBroker {
-    constructor(opts) {
-        this.opts = opts;
-        this.waitPromises = new Map();
-        this.providers = {};
-        this.pending = {};
-        this.pendingIdGen = 0;
-        this.logger = opts.logger ?? console;
-        this.shutdown$ = new rxjs.ReplaySubject(1);
-        this.connection$ = connect(opts.url).pipe(rxjs.tap({
-            error: err => {
-                this.logger.info("Failed to connect to service broker,", String(err));
+function assertRecord(value) {
+}
+export function connect(url, opts = {}) {
+    const providers = new Map();
+    const waitEndpoints = new Map();
+    return connectWebSocket(url).pipe(rxjs.map(con => makeClient(con, providers, waitEndpoints, opts)));
+}
+function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, streamingChunkSize }) {
+    const transmit = rxjs.bindNodeCallback(con.send).bind(con);
+    const sendSubject = new rxjs.Subject();
+    const pendingIdGen = makeIdGen();
+    const pendingResponses = new Map();
+    return {
+        event$: rxjs.merge(
+        //WARNING: this must come before the others!
+        sendSubject.pipe(rxjs.concatMap(({ msg, subscriber }) => rxjs.defer(() => {
+            const data = serialize(msg, streamingChunkSize);
+            if (rxjs.isObservable(data)) {
+                return data.pipe(rxjs.concatMap(chunk => transmit(chunk, {})), rxjs.ignoreElements(), rxjs.endWith(undefined));
             }
-        }), opts.disableAutoReconnect ? rxjs.identity : rxjs.retry({ delay: 15000 }), rxjs.exhaustMap(conn => {
-            this.logger.info("Service broker connection established");
-            conn.send(JSON.stringify({
-                authToken: this.opts.authToken,
-                type: "SbAdvertiseRequest",
-                services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
+            else {
+                return transmit(data, {});
+            }
+        }).pipe(rxjs.tap(subscriber), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+            type: 'send-error',
+            message: msg,
+            error: err
+        }))))), 
+        //readvertise services on reconnect
+        rxjs.defer(() => {
+            const services = Array.from(providers.values())
+                .filter(x => x.advertise)
+                .map(x => x.service);
+            return rxjs.iif(() => services.length > 0, sendAdvertisement(services).pipe(rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+                type: 'send-error',
+                message: { header: { type: 'SbAdvertiseRequest', services } },
+                error: err
+            }))), rxjs.EMPTY);
+        }), 
+        //resend endpointWaitRequests on reconnect
+        rxjs.defer(() => rxjs.from(waitEndpoints.keys()).pipe(rxjs.concatMap(endpointId => send({
+            header: {
+                type: "SbEndpointWaitRequest",
+                endpointId
+            }
+        })), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+            type: 'send-error',
+            message: { header: { type: 'SbEndpointWaitRequest' } },
+            error: err
+        })))), con.message$.pipe(rxjs.mergeMap(event => processMessage(event.data).pipe(rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+            type: 'receive-error',
+            message: event.data,
+            error: err
+        }))))), con.error$.pipe(rxjs.map(event => ({
+            type: 'socket-error',
+            error: event.error
+        }))), !keepAlive
+            ? rxjs.EMPTY
+            : con.keepAlive(keepAlive.pingInterval, keepAlive.pongTimeout).pipe(rxjs.ignoreElements(), rxjs.catchError(err => {
+                con.terminate();
+                return rxjs.of({
+                    type: 'keep-alive-error',
+                    error: err
+                });
+            }))),
+        close$: con.close$,
+        close: con.close.bind(con),
+        debug: {
+            con
+        },
+        advertise(service, handler) {
+            assert(!providers.has(service.name), `${service.name} provider already exists`);
+            return sendAdvertisement(Array.from(providers.values())
+                .filter(x => x.advertise)
+                .map(x => x.service)
+                .concat(service)).pipe(rxjs.tap(() => {
+                providers.set(service.name, {
+                    service,
+                    handler,
+                    advertise: true
+                });
             }));
-            this.opts.onConnect?.();
-            return rxjs.merge(conn.message$.pipe(rxjs.tap(event => {
-                try {
-                    this.onMessage(event.data);
+        },
+        unadvertise(serviceName) {
+            assert(providers.has(serviceName), `${serviceName} provider not exists`);
+            return sendAdvertisement(Array.from(providers.values())
+                .filter(x => x.advertise && x.service.name != serviceName)
+                .map(x => x.service)).pipe(rxjs.tap(() => {
+                providers.delete(serviceName);
+            }));
+        },
+        setServiceHandler(serviceName, handler) {
+            assert(!providers.has(serviceName), `${serviceName} provider already exists`);
+            providers.set(serviceName, {
+                service: { name: serviceName },
+                handler,
+                advertise: false
+            });
+        },
+        request(service, req, timeout) {
+            return sendReq({
+                header: {
+                    ...req.header,
+                    ...reservedFields,
+                    type: "ServiceRequest",
+                    service
+                },
+                payload: req.payload
+            }, timeout);
+        },
+        notify(service, msg) {
+            return send({
+                header: {
+                    ...msg.header,
+                    ...reservedFields,
+                    type: "ServiceRequest",
+                    service
+                },
+                payload: msg.payload
+            });
+        },
+        requestTo(endpointId, serviceName, req, timeout) {
+            return sendReq({
+                header: {
+                    ...req.header,
+                    ...reservedFields,
+                    to: endpointId,
+                    type: "ServiceRequest",
+                    service: { name: serviceName }
+                },
+                payload: req.payload
+            }, timeout);
+        },
+        notifyTo(endpointId, serviceName, msg) {
+            return send({
+                header: {
+                    ...msg.header,
+                    ...reservedFields,
+                    to: endpointId,
+                    type: "ServiceRequest",
+                    service: { name: serviceName }
+                },
+                payload: msg.payload
+            });
+        },
+        publish(topic, text) {
+            return send({
+                header: {
+                    type: "ServiceRequest",
+                    service: { name: "#" + topic }
+                },
+                payload: text
+            });
+        },
+        subscribe(topic, handler) {
+            return this.advertise({ name: "#" + topic }, msg => handler(msg.payload));
+        },
+        unsubscribe(topic) {
+            return this.unadvertise("#" + topic);
+        },
+        status() {
+            return sendReq({
+                header: { type: "SbStatusRequest" }
+            }).pipe(rxjs.map(res => JSON.parse(res.payload)));
+        },
+        cleanup() {
+            return send({
+                header: {
+                    type: "SbCleanupRequest"
                 }
-                catch (err) {
-                    this.logger.error(err);
-                }
-            })), conn.error$.pipe(rxjs.tap(event => this.logger.error(event.error))), conn.keepAlive((opts.keepAliveIntervalSeconds ?? 30) * 1000, 3000).pipe(rxjs.catchError(err => {
-                this.logger.info("Pong timeout,", err.message);
-                conn.terminate();
-                return rxjs.EMPTY;
-            }))).pipe(rxjs.ignoreElements(), rxjs.startWith(conn), rxjs.endWith(null), rxjs.takeUntil(rxjs.merge(conn.close$.pipe(rxjs.tap(event => {
-                this.logger.info("Service broker connection lost,", event.code, event.reason);
-            })))), rxjs.finalize(() => conn.close()));
-        }), opts.disableAutoReconnect ? rxjs.identity : rxjs.repeat({ delay: 1000 }), rxjs.takeUntil(this.shutdown$), rxjs.shareReplay(1));
-    }
-    onMessage(data) {
-        let msg;
-        try {
-            if (typeof data == "string")
-                msg = this.messageFromString(data);
-            else if (Buffer.isBuffer(data))
-                msg = this.messageFromBuffer(data);
-            else
-                throw new Error("Message is not a string or Buffer");
-        }
-        catch (err) {
-            this.logger.error(String(err));
-            return;
-        }
-        if (msg.header.type == "ServiceRequest")
-            this.onServiceRequest(msg);
-        else if (msg.header.type == "ServiceResponse")
-            this.onServiceResponse(msg);
-        else if (msg.header.type == "SbStatusResponse")
-            this.onServiceResponse(msg);
-        else if (msg.header.type == "SbEndpointWaitResponse")
-            this.onServiceResponse(msg);
-        else if (msg.header.error)
-            this.onServiceResponse(msg);
-        else if (msg.header.service)
-            this.onServiceRequest(msg);
-        else
-            this.logger.error("Don't know what to do with message:", msg.header);
-    }
-    async onServiceRequest(msg) {
-        try {
-            if (this.providers[msg.header.service.name]) {
-                const res = await this.providers[msg.header.service.name].handler(msg) || {};
-                if (msg.header.id) {
-                    const header = {
-                        to: msg.header.from,
-                        id: msg.header.id,
-                        type: "ServiceResponse"
-                    };
-                    await this.send(Object.assign({}, res.header, reservedFields, header), res.payload);
-                }
-            }
-            else
-                throw new Error("No provider for service " + msg.header.service.name);
-        }
-        catch (err) {
-            if (msg.header.id) {
-                await this.send({
-                    to: msg.header.from,
-                    id: msg.header.id,
-                    type: "ServiceResponse",
-                    error: err instanceof Error ? err.message : String(err)
+            });
+        },
+        waitEndpoint(endpointId) {
+            let waiter = waitEndpoints.get(endpointId);
+            if (!waiter) {
+                const closeSubject = new rxjs.ReplaySubject();
+                waitEndpoints.set(endpointId, waiter = {
+                    closeSubject,
+                    close$: send({
+                        header: {
+                            type: "SbEndpointWaitRequest",
+                            endpointId
+                        }
+                    }).pipe(rxjs.exhaustMap(() => closeSubject), rxjs.finalize(() => waitEndpoints.delete(endpointId)))
                 });
             }
-            else
-                this.logger.error(String(err), msg.header);
+            return waiter.close$;
         }
-    }
-    onServiceResponse(msg) {
-        if (this.pending[msg.header.id])
-            this.pending[msg.header.id].process(msg);
-        else
-            this.logger.error("Response received but no pending request:", msg.header);
-    }
-    messageFromString(str) {
-        if (str[0] != "{")
-            throw new Error("Message doesn't have JSON header");
-        const index = str.indexOf("\n");
-        const headerStr = (index != -1) ? str.slice(0, index) : str;
-        const payload = (index != -1) ? str.slice(index + 1) : undefined;
-        let header;
-        try {
-            header = JSON.parse(headerStr);
-        }
-        catch (err) {
-            throw new Error("Failed to parse message header");
-        }
-        return { header, payload };
-    }
-    messageFromBuffer(buf) {
-        if (buf[0] != 123)
-            throw new Error("Message doesn't have JSON header");
-        const index = buf.indexOf("\n");
-        const headerStr = (index != -1) ? buf.slice(0, index).toString() : buf.toString();
-        const payload = (index != -1) ? buf.slice(index + 1) : undefined;
-        let header;
-        try {
-            header = JSON.parse(headerStr);
-        }
-        catch (err) {
-            throw new Error("Failed to parse message header");
-        }
-        return { header, payload };
-    }
-    async send(header, payload) {
-        const ws = await rxjs.firstValueFrom(this.connection$);
-        if (!ws)
-            throw new Error("No connection");
-        const headerStr = JSON.stringify(header);
-        if (payload) {
-            if (typeof payload == "string") {
-                ws.send(headerStr + "\n" + payload);
-            }
-            else if (Buffer.isBuffer(payload)) {
-                const headerLen = Buffer.byteLength(headerStr);
-                const tmp = Buffer.allocUnsafe(headerLen + 1 + payload.length);
-                tmp.write(headerStr);
-                tmp[headerLen] = 10;
-                payload.copy(tmp, headerLen + 1);
-                ws.send(tmp);
-            }
-            else if (payload.pipe) {
-                const stream = this.packetizer(64 * 1000);
-                stream.on("data", data => this.send(Object.assign({}, header, { part: true }), data));
-                stream.on("end", () => this.send(header));
-                payload.pipe(stream);
-            }
-            else
-                throw new Error("Unexpected");
-        }
-        else
-            ws.send(headerStr);
-    }
-    packetizer(size) {
-        let buf;
-        let pos;
-        return new Transform({
-            transform: function (chunk, encoding, callback) {
-                while (chunk.length) {
-                    if (!buf) {
-                        buf = Buffer.alloc(size);
-                        pos = 0;
-                    }
-                    const count = chunk.copy(buf, pos);
-                    pos += count;
-                    if (pos >= buf.length) {
-                        this.push(buf);
-                        buf = null;
-                    }
-                    chunk = chunk.slice(count);
-                }
-                callback();
+    };
+    function sendAdvertisement(services) {
+        return sendReq({
+            header: {
+                authToken,
+                type: "SbAdvertiseRequest"
             },
-            flush: function (callback) {
-                if (buf) {
-                    this.push(buf.slice(0, pos));
-                    buf = null;
-                }
-                callback();
+            payload: JSON.stringify(services)
+        });
+    }
+    function processMessage(data) {
+        const msg = deserialize(data);
+        if (msg.header.type == "ServiceRequest")
+            return onServiceRequest(msg);
+        else if (msg.header.type == "ServiceResponse")
+            return onServiceResponse(msg);
+        else if (msg.header.type == "SbAdvertiseResponse")
+            return onServiceResponse(msg);
+        else if (msg.header.type == "SbStatusResponse")
+            return onServiceResponse(msg);
+        else if (msg.header.type == "SbEndpointWaitResponse")
+            return onEndpointWaitResponse(msg);
+        else if (msg.header.error)
+            return onServiceResponse(msg);
+        else if (msg.header.service)
+            return onServiceRequest(msg);
+        else
+            throw new Error("Don't know what to do with message");
+    }
+    function onServiceRequest(req) {
+        return rxjs.defer(() => {
+            assert(typeof req.header.service == 'object' && req.header.service != null, 'BAD_REQUEST');
+            assertRecord(req.header.service);
+            assert(typeof req.header.service.name == 'string', 'BAD_REQUEST');
+            const provider = providers.get(req.header.service.name);
+            assert(provider, "NO_PROVIDER " + req.header.service.name);
+            return Promise.resolve(provider.handler(req));
+        }).pipe(rxjs.map(res => res ?? {}), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
+            header: {
+                ...res.header,
+                ...reservedFields,
+                to: req.header.from,
+                id: req.header.id,
+                type: "ServiceResponse"
+            },
+            payload: res.payload
+        }), rxjs.EMPTY)), rxjs.catchError(err => rxjs.iif(() => req.header.id != null, send({
+            header: {
+                to: req.header.from,
+                id: req.header.id,
+                type: "ServiceResponse",
+                error: err instanceof Error ? err.message : String(err)
             }
+        }), rxjs.throwError(() => new Error('Potentially silent error thrown by notification handler', { cause: err })))));
+    }
+    function onServiceResponse(msg) {
+        const pending = pendingResponses.get(msg.header.id);
+        if (pending) {
+            pending.next(msg);
+            return rxjs.EMPTY;
+        }
+        else {
+            throw new Error("Response received but no pending request");
+        }
+    }
+    function onEndpointWaitResponse(msg) {
+        const waiter = waitEndpoints.get(msg.header.endpointId);
+        if (waiter) {
+            waiter.closeSubject.next();
+            waiter.closeSubject.complete();
+            return rxjs.EMPTY;
+        }
+        else {
+            throw new Error("Stray EndpointWaitResponse");
+        }
+    }
+    function send(msg) {
+        return new rxjs.Observable(subscriber => {
+            sendSubject.next({ msg, subscriber });
         });
     }
-    async advertise(service, handler) {
-        assert(service && service.name && handler, "Missing args");
-        assert(!this.providers[service.name], `${service.name} provider already exists`);
-        this.providers[service.name] = {
-            service,
-            handler,
-            advertise: true
-        };
-        await this.send({
-            authToken: this.opts.authToken,
-            type: "SbAdvertiseRequest",
-            services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
+    function sendReq(msg, timeout = 30000) {
+        return rxjs.defer(() => {
+            const id = pendingIdGen.next().value;
+            msg.header.id = id;
+            return send(msg).pipe(rxjs.exhaustMap(() => new rxjs.Observable(subscriber => {
+                pendingResponses.set(id, subscriber);
+                return () => pendingResponses.delete(id);
+            })), rxjs.share(), src$ => src$.pipe(rxjs.first(), timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout), rxjs.exhaustMap(res => rxjs.iif(() => !!res.header.part, rxjs.defer(() => {
+                const stream = new PassThrough();
+                const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream);
+                return src$.pipe(rxjs.startWith(res), rxjs.takeWhile(msg => !!msg.header.part, true), rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY), rxjs.finalize(() => stream.end()), rxjs.ignoreElements(), rxjs.startWith({ header: res.header, payload: stream }));
+            }), rxjs.iif(() => !!res.header.error, rxjs.throwError(() => typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error), rxjs.of(res)))), rxjs.share({ resetOnRefCountZero: false })));
         });
-    }
-    async unadvertise(serviceName) {
-        assert(serviceName, "Missing args");
-        assert(this.providers[serviceName], `${serviceName} provider not exists`);
-        delete this.providers[serviceName];
-        await this.send({
-            authToken: this.opts.authToken,
-            type: "SbAdvertiseRequest",
-            services: Object.values(this.providers).filter(x => x.advertise).map(x => x.service)
-        });
-    }
-    setServiceHandler(serviceName, handler) {
-        assert(serviceName && handler, "Missing args");
-        assert(!this.providers[serviceName], `${serviceName} provider already exists`);
-        this.providers[serviceName] = {
-            service: { name: serviceName },
-            handler,
-            advertise: false
-        };
-    }
-    async request(service, req, timeout) {
-        assert(service && service.name && req, "Missing args");
-        const id = String(++this.pendingIdGen);
-        const promise = this.pendingResponse(id, timeout);
-        const header = {
-            id,
-            type: "ServiceRequest",
-            service
-        };
-        await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-        return promise;
-    }
-    async notify(service, msg) {
-        assert(service && service.name && msg, "Missing args");
-        const header = {
-            type: "ServiceRequest",
-            service
-        };
-        await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
-    }
-    async requestTo(endpointId, serviceName, req, timeout) {
-        assert(endpointId && serviceName && req, "Missing args");
-        const id = String(++this.pendingIdGen);
-        const promise = this.pendingResponse(id, timeout);
-        const header = {
-            to: endpointId,
-            id,
-            type: "ServiceRequest",
-            service: { name: serviceName }
-        };
-        await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-        return promise;
-    }
-    async notifyTo(endpointId, serviceName, msg) {
-        assert(endpointId && serviceName && msg, "Missing args");
-        const header = {
-            to: endpointId,
-            type: "ServiceRequest",
-            service: { name: serviceName }
-        };
-        await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
-    }
-    pendingResponse(id, timeout) {
-        const promise = new Promise((fulfill, reject) => {
-            let stream;
-            this.pending[id] = {
-                process: res => {
-                    if (res.header.error)
-                        reject(new Error(res.header.error));
-                    else {
-                        if (res.header.part) {
-                            if (!stream)
-                                fulfill({ header: res.header, payload: stream = new PassThrough() });
-                            stream.write(res.payload);
-                        }
-                        else {
-                            delete this.pending[id];
-                            if (stream)
-                                stream.end(res.payload);
-                            else
-                                fulfill(res);
-                        }
-                    }
-                }
-            };
-        });
-        return pTimeout(promise, timeout || 30 * 1000)
-            .catch(err => {
-            delete this.pending[id];
-            throw err;
-        });
-    }
-    async publish(topic, text) {
-        assert(topic && text, "Missing args");
-        await this.send({
-            type: "ServiceRequest",
-            service: { name: "#" + topic }
-        }, text);
-    }
-    async subscribe(topic, handler) {
-        assert(topic && handler, "Missing args");
-        await this.advertise({ name: "#" + topic }, (msg) => handler(msg.payload));
-    }
-    async unsubscribe(topic) {
-        assert(topic, "Missing args");
-        await this.unadvertise("#" + topic);
-    }
-    async status() {
-        const id = String(++this.pendingIdGen);
-        await this.send({
-            id,
-            type: "SbStatusRequest"
-        });
-        const res = await this.pendingResponse(id);
-        return JSON.parse(res.payload);
-    }
-    async cleanup() {
-        await this.send({
-            type: "SbCleanupRequest"
-        });
-    }
-    async wait(endpointId) {
-        const id = String(++this.pendingIdGen);
-        await this.send({
-            id,
-            type: "SbEndpointWaitRequest",
-            endpointId
-        });
-        await this.pendingResponse(id, Infinity);
-    }
-    waitEndpoint(endpointId) {
-        let promise = this.waitPromises.get(endpointId);
-        if (!promise)
-            this.waitPromises.set(endpointId, promise = this.wait(endpointId).finally(() => this.waitPromises.delete(endpointId)));
-        return promise;
-    }
-    shutdown() {
-        this.shutdown$.next();
     }
 }
 //# sourceMappingURL=index.js.map

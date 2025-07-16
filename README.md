@@ -17,12 +17,26 @@ const sb = new ServiceBroker({
   authToken?: string,
   // callback for when connection is established (or re-established)
   onConnect?: () => void,
-  // disable auto-reconnect function (upon connect failure or connection loss)
-  disableAutoReconnect?: boolean,
-  // whether to send websocket pings periodically
-  keepAliveIntervalSeconds?: number,
-  // logger for info and errors
-  logger?: Logger,
+  // whether to retry upon connect failure
+  retryConfig?: rxjs.RetryConfig,
+  // whether to repeat upon connection loss
+  repeatConfig?: rxjs.RepeatConfig,
+  // how often to send pings
+  pingInterval?: number,
+})
+```
+
+
+### Events
+```typescript
+sb.on('connect', () => {
+  console.log('Connection established')
+})
+sb.on('disconnect', ({ code: number, reason: string }) => {
+  console.log('Connection lost', code, reason)
+})
+sb.on('error', ({ context: 'connect'|'process-message'|'keep-alive'|'other', error: any }) => {
+  console.log('Error occurred', context, error)
 })
 ```
 
