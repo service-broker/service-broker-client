@@ -11,15 +11,18 @@ export interface MessageWithHeader extends Message {
 }
 export type ServiceBroker = ReturnType<typeof makeClient>;
 export interface ConnectOptions {
-    authToken?: string;
     keepAlive?: {
         pingInterval: number;
         pongTimeout: number;
     };
     streamingChunkSize?: number;
-    handle?: (request: MessageWithHeader) => void | Message | rxjs.Observable<void | Message>;
 }
-type ErrorEvent = {
+export type ServiceEvent = {
+    type: 'service-request';
+    request: MessageWithHeader;
+    responseSubject: rxjs.Subject<Message | void>;
+};
+export type ErrorEvent = {
     type: 'send-error';
     message?: MessageWithHeader;
     error: unknown;
@@ -35,13 +38,14 @@ type ErrorEvent = {
     error: unknown;
 };
 export declare function connect(url: string, opts?: ConnectOptions): rxjs.Observable<{
-    event$: rxjs.Observable<ErrorEvent>;
-    close$: rxjs.Observable<WebSocket.CloseEvent>;
-    close: (code?: number, data?: string | Buffer) => void;
-    debug: {
+    _debug: {
         con: Connection;
     };
-    advertise({ services, topics }: {
+    request$: rxjs.Observable<ServiceEvent>;
+    error$: rxjs.Observable<ErrorEvent>;
+    close$: rxjs.Observable<WebSocket.CloseEvent>;
+    close: (code?: number, data?: string | Buffer) => void;
+    advertise({ services, topics, authToken }: {
         services: {
             name: string;
             capabilities?: string[];
@@ -51,6 +55,7 @@ export declare function connect(url: string, opts?: ConnectOptions): rxjs.Observ
             name: string;
             capabilities?: string[];
         }[];
+        authToken?: string;
     }): rxjs.Observable<MessageWithHeader>;
     request(service: {
         name: string;
@@ -70,14 +75,15 @@ export declare function connect(url: string, opts?: ConnectOptions): rxjs.Observ
 declare function makeClient(con: Connection, waitEndpoints: Map<string, {
     closeSubject: rxjs.Subject<void>;
     close$: rxjs.Observable<void>;
-}>, { authToken, keepAlive, streamingChunkSize, handle }: ConnectOptions): {
-    event$: rxjs.Observable<ErrorEvent>;
-    close$: rxjs.Observable<WebSocket.CloseEvent>;
-    close: (code?: number, data?: string | Buffer) => void;
-    debug: {
+}>, opts: ConnectOptions): {
+    _debug: {
         con: Connection;
     };
-    advertise({ services, topics }: {
+    request$: rxjs.Observable<ServiceEvent>;
+    error$: rxjs.Observable<ErrorEvent>;
+    close$: rxjs.Observable<WebSocket.CloseEvent>;
+    close: (code?: number, data?: string | Buffer) => void;
+    advertise({ services, topics, authToken }: {
         services: {
             name: string;
             capabilities?: string[];
@@ -87,6 +93,7 @@ declare function makeClient(con: Connection, waitEndpoints: Map<string, {
             name: string;
             capabilities?: string[];
         }[];
+        authToken?: string;
     }): rxjs.Observable<MessageWithHeader>;
     request(service: {
         name: string;

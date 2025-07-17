@@ -3,9 +3,9 @@ import assert from "assert"
 import dotenv from "dotenv"
 import * as rxjs from "rxjs"
 import { PassThrough, Readable } from "stream"
-import { connect, ConnectOptions, Message, MessageWithHeader, ServiceBroker } from "./index.js"
+import { connect, ConnectOptions, Message, MessageWithHeader, ServiceBroker, ServiceEvent } from "./index.js"
 
-dotenv.config()
+dotenv.config({ quiet: true })
 
 assert(process.env.SERVICE_BROKER_URL, "Missing env SERVICE_BROKER_URL")
 const serviceBrokerUrl = process.env.SERVICE_BROKER_URL
@@ -21,21 +21,26 @@ function lvf<T>(v$: rxjs.Observable<T>) {
 
 function sbConnect(url: string, queue: ReturnType<typeof makeQueue>, opts?: ConnectOptions) {
   return connect(url, opts).pipe(
-    rxjs.exhaustMap(sb =>
-      rxjs.concat(
-        rxjs.of(sb),
-        sb.event$.pipe(
-          rxjs.tap(event => queue.push('ErrorEvent', event)),
-          rxjs.ignoreElements()
+    rxjs.exhaustMap(sb => {
+      queue.push('ServiceBroker', sb)
+      return rxjs.merge(
+        sb.request$.pipe(
+          rxjs.tap(event => queue.push('ServiceEvent', event))
+        ),
+        sb.error$.pipe(
+          rxjs.tap(event => queue.push('ErrorEvent', event))
         )
       ).pipe(
-        rxjs.takeUntil(sb.close$),
+        rxjs.takeUntil(
+          sb.close$.pipe(
+            rxjs.tap(event => queue.push('CloseEvent', event))
+          )
+        ),
         rxjs.finalize(() => sb.close())
       )
-    ),
+    }),
     rxjs.repeat({ delay: 100 }),
   ).subscribe({
-    next: sb => queue.push('ServiceBroker', sb),
     error: err => queue.push('Error', err)
   })
 }
@@ -108,38 +113,43 @@ describe('config', ({ beforeEach, afterEach, test }) => {
   test('wait-endpoint', async () => {
     subs.push(sbConnect(serviceBrokerUrl, queue))
     const client = await queue.wait<ServiceBroker>('ServiceBroker')
-    subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, handle: req => queue.push('Request', req) }))
+    subs.push(sbConnect(serviceBrokerUrl, queue))
     const provider = await queue.wait<ServiceBroker>('ServiceBroker')
 
-    await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [] }))
-    await lvf(client.request({ name: 'hello' }, { payload: 'text' }))
-    const req = queue.take<MessageWithHeader>('Request')
-    expect(req.payload, 'text')
-    const clientEndpointId = req.header.from as string
+    await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [], authToken }))
+    lvf(client.request({ name: 'hello' }, { payload: 'text' }))
+    const { request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent')
+    responseSubject.next()
+    expect(request.payload, 'text')
+    const clientEndpointId = request.header.from as string
     provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0))
 
     await new Promise(f => setTimeout(f, 100))
-    client.debug.con.close()
+    client._debug.con.close()
+    await queue.wait('CloseEvent')
     await queue.wait('disconnect')
   })
 
   test('reconnect-wait-endpoint', async () => {
     subs.push(sbConnect(serviceBrokerUrl, queue))
     const client = await queue.wait<ServiceBroker>('ServiceBroker')
-    subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, handle: req => queue.push('Request', req) }))
+    subs.push(sbConnect(serviceBrokerUrl, queue))
     let provider = await queue.wait<ServiceBroker>('ServiceBroker')
 
-    await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [] }))
-    await lvf(client.request({ name: 'hello' }, { payload: 'text' }))
-    const req = queue.take<MessageWithHeader>('Request')
-    expect(req.payload, 'text')
-    const clientEndpointId = req.header.from as string
+    await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [], authToken }))
+    lvf(client.request({ name: 'hello' }, { payload: 'text' }))
+    const { request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent')
+    responseSubject.next()
+    expect(request.payload, 'text')
+    const clientEndpointId = request.header.from as string
     provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0))
 
     await new Promise(f => setTimeout(f, 100))
-    provider.debug.con.close()
+    provider._debug.con.close()
+    await queue.wait('CloseEvent')
     provider = await queue.wait<ServiceBroker>('ServiceBroker')
-    client.debug.con.close()
+    client._debug.con.close()
+    await queue.wait('CloseEvent')
     await queue.wait('disconnect')
   })
 
@@ -174,21 +184,23 @@ describe('pub-sub', ({ beforeEach, afterEach, test }) => {
   })
 
   test("basic", async () => {
-    subs.push(sbConnect(serviceBrokerUrl, queue, { handle: req => queue.push('Message', req) }))
+    subs.push(sbConnect(serviceBrokerUrl, queue))
     const subscriber = await queue.wait<ServiceBroker>('ServiceBroker')
     subs.push(sbConnect(serviceBrokerUrl, queue))
     const publisher = await queue.wait<ServiceBroker>('ServiceBroker')
 
     await lvf(subscriber.advertise({ services: [], topics: [{ name: "test-log" }] }))
     await lvf(publisher.publish("test-log", "what in the world"))
-    expect(await queue.wait('Message'), {
-      header: {
-        from: valueOfType('string'),
-        ip: localIp,
-        service: { name: '#test-log' }
-      },
-      payload: "what in the world"
-    })
+    expect(await queue.wait('ServiceEvent'), objectHaving({
+      request: {
+        header: {
+          from: valueOfType('string'),
+          ip: localIp,
+          service: { name: '#test-log' }
+        },
+        payload: "what in the world"
+      }
+    }))
   })
 })
 
@@ -210,16 +222,14 @@ describe("service", ({ beforeEach, afterEach, test }) => {
   test("request-response", async () => {
     subs.push(sbConnect(serviceBrokerUrl, queue))
     const client = await queue.wait<ServiceBroker>('ServiceBroker')
-    subs.push(sbConnect(serviceBrokerUrl, queue, {
-      authToken,
-      handle: req => new rxjs.Observable(sub => queue.push('Request', { req, sub }))
-    }))
+    subs.push(sbConnect(serviceBrokerUrl, queue))
     const provider = await queue.wait<ServiceBroker>('ServiceBroker')
 
     //advertise
     await lvf(provider.advertise({
       services: [{ name: "test-tts", capabilities: ["v1", "v2"], priority: 1 }],
-      topics: []
+      topics: [],
+      authToken
     }))
 
     //request
@@ -228,8 +238,8 @@ describe("service", ({ beforeEach, afterEach, test }) => {
       payload: "this is request payload"
     }))
 
-    let { req, sub } = await queue.wait<{ req: MessageWithHeader, sub: rxjs.Subscriber<Message> }>('Request')
-    expect(req, {
+    let { request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent')
+    expect(request, {
       header: {
         from: valueOfType('string'),
         id: valueOfType('string'),
@@ -244,7 +254,7 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     })
 
     //respond
-    sub.next({
+    responseSubject.next({
       header: { result: 1 },
       payload: Buffer.from("this is response payload")
     })
@@ -253,15 +263,15 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     expect(res, {
       header: {
         from: valueOfType('string'),
-        to: req.header.from,
-        id: req.header.id,
+        to: request.header.from,
+        id: request.header.id,
         type: "ServiceResponse",
         result: 1
       },
       payload: Buffer.from("this is response payload")
     })
 
-    const clientEndpointId = req.header.from
+    const clientEndpointId = request.header.from
     const providerEndpointId = res.header!.from as string
 
     //requestTo
@@ -270,8 +280,8 @@ describe("service", ({ beforeEach, afterEach, test }) => {
       payload: "Direct request payload"
     }));
 
-    ({ req, sub } = await queue.wait<{ req: MessageWithHeader, sub: rxjs.Subscriber<Message> }>('Request'))
-    expect(req, {
+    ({ request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent'))
+    expect(request, {
       header: {
         from: clientEndpointId,
         to: providerEndpointId,
@@ -283,7 +293,7 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     })
 
     //respond
-    sub.next({
+    responseSubject.next({
       header: { output: "crap" },
       payload: Buffer.from("Direct response payload")
     })
@@ -291,8 +301,8 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     expect(await promise, {
       header: {
         from: providerEndpointId,
-        to: req.header.from,
-        id: req.header.id,
+        to: request.header.from,
+        id: request.header.id,
         type: "ServiceResponse",
         output: "crap"
       },
@@ -305,8 +315,8 @@ describe("service", ({ beforeEach, afterEach, test }) => {
       payload: Buffer.from("Direct notify payload")
     }));
 
-    ({ req, sub } = await queue.wait<{ req: MessageWithHeader, sub: rxjs.Subscriber<Message> }>('Request'))
-    expect(req, {
+    ({ request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent'))
+    expect(request, {
       header: {
         from: clientEndpointId,
         to: providerEndpointId,
@@ -316,7 +326,7 @@ describe("service", ({ beforeEach, afterEach, test }) => {
       payload: Buffer.from("Direct notify payload")
     })
 
-    sub.next({})
+    responseSubject.next()
 
     //unadvertise
     await lvf(provider.advertise({ services: [], topics: [] }))
@@ -334,34 +344,33 @@ describe("service", ({ beforeEach, afterEach, test }) => {
   test('streaming', async () => {
     subs.push(sbConnect(serviceBrokerUrl, queue))
     const client = await queue.wait<ServiceBroker>('ServiceBroker')
-    subs.push(sbConnect(serviceBrokerUrl, queue, {
-      authToken,
-      streamingChunkSize: 10,
-      handle(msg) {
-        assert(msg.payload == 'stream request')
-        const stream = new PassThrough()
-        const chunks = ['abcdefghijkl', 'mnop', 'qrstuvwxyz1234567890']
-        rxjs.from(chunks).pipe(
-          rxjs.concatMap(chunk =>
-            rxjs.of(chunk).pipe(
-              rxjs.concatWith(
-                rxjs.timer(100).pipe(
-                  rxjs.ignoreElements()
-                )
-              )
+    subs.push(sbConnect(serviceBrokerUrl, queue, { streamingChunkSize: 10 }))
+    const provider = await queue.wait<ServiceBroker>('ServiceBroker')
+    await lvf(provider.advertise({ services: [{ name: 'tts' }], topics: [], authToken }))
+
+    let promise = lvf(client.request({ name: 'tts' }, { payload: 'stream request' }))
+    const { request, responseSubject } = await queue.wait<ServiceEvent>('ServiceEvent')
+    expect(request.payload, 'stream request')
+    const stream = new PassThrough()
+    responseSubject.next({ payload: stream })
+
+    const chunks = ['abcdefghijkl', 'mnop', 'qrstuvwxyz1234567890']
+    rxjs.from(chunks).pipe(
+      rxjs.concatMap(chunk =>
+        rxjs.of(chunk).pipe(
+          rxjs.concatWith(
+            rxjs.timer(100).pipe(
+              rxjs.ignoreElements()
             )
           )
-        ).subscribe({
-          next: chunk => stream.write(Buffer.from(chunk)),
-          complete: () => stream.end()
-        })
-        return { payload: stream }
-      }
-    }))
-    const provider = await queue.wait<ServiceBroker>('ServiceBroker')
-    await lvf(provider.advertise({ services: [{ name: 'tts' }], topics: [] }))
+        )
+      )
+    ).subscribe({
+      next: chunk => stream.write(Buffer.from(chunk)),
+      complete: () => stream.end()
+    })
 
-    const res = await lvf(client.request({ name: 'tts' }, { payload: 'stream request' }))
+    const res = await promise
     assert(res.payload instanceof Readable)
     expect(
       await lvf(

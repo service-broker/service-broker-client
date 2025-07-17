@@ -20,59 +20,71 @@ export function connect(url, opts = {}) {
     const waitEndpoints = new Map();
     return connectWebSocket(url).pipe(rxjs.map(con => makeClient(con, waitEndpoints, opts)));
 }
-function makeClient(con, waitEndpoints, { authToken, keepAlive, streamingChunkSize, handle }) {
+function makeClient(con, waitEndpoints, opts) {
     const transmit = rxjs.bindNodeCallback(con.send).bind(con);
     const sendSubject = new rxjs.Subject();
     const pendingIdGen = makeIdGen();
     const pendingResponses = new Map();
-    return {
-        event$: rxjs.merge(
-        //WARNING: this must come before the others!
-        sendSubject.pipe(rxjs.concatMap(({ msg, subscriber }) => rxjs.defer(() => {
-            const data = serialize(msg, streamingChunkSize);
-            if (rxjs.isObservable(data)) {
-                return data.pipe(rxjs.concatMap(chunk => transmit(chunk, {})), rxjs.ignoreElements(), rxjs.endWith(undefined));
-            }
-            else {
-                return transmit(data, {});
-            }
-        }).pipe(rxjs.tap(subscriber), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-            type: 'send-error',
-            message: msg,
-            error: err
-        }))))), 
-        //resend endpointWaitRequests on reconnect
-        rxjs.defer(() => rxjs.from(waitEndpoints.keys()).pipe(rxjs.concatMap(endpointId => send({
-            header: {
-                type: "SbEndpointWaitRequest",
-                endpointId
-            }
-        })), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-            type: 'send-error',
-            message: { header: { type: 'SbEndpointWaitRequest' } },
-            error: err
-        })))), con.message$.pipe(rxjs.mergeMap(event => processMessage(event.data).pipe(rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-            type: 'receive-error',
-            message: event.data,
-            error: err
-        }))))), con.error$.pipe(rxjs.map(event => ({
-            type: 'socket-error',
-            error: event.error
-        }))), !keepAlive
-            ? rxjs.EMPTY
-            : con.keepAlive(keepAlive.pingInterval, keepAlive.pongTimeout).pipe(rxjs.ignoreElements(), rxjs.catchError(err => {
+    //background activities
+    const send$ = sendSubject.pipe(rxjs.concatMap(({ msg, subscriber }) => rxjs.defer(() => {
+        const data = serialize(msg, opts.streamingChunkSize);
+        if (rxjs.isObservable(data)) {
+            return data.pipe(rxjs.concatMap(chunk => transmit(chunk, {})), rxjs.ignoreElements(), rxjs.endWith(undefined));
+        }
+        else {
+            return transmit(data, {});
+        }
+    }).pipe(rxjs.tap(subscriber), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+        type: 'send-error',
+        message: msg,
+        error: err
+    })))), rxjs.share());
+    const doOnce$ = rxjs.merge(
+    //resend endpointWaitRequests on reconnect
+    rxjs.defer(() => rxjs.from(waitEndpoints.keys()).pipe(rxjs.concatMap(endpointId => send({
+        header: {
+            type: "SbEndpointWaitRequest",
+            endpointId
+        }
+    })), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
+        type: 'send-error',
+        message: { header: { type: 'SbEndpointWaitRequest' } },
+        error: err
+    }))))).pipe(rxjs.share());
+    const receive$ = con.message$.pipe(rxjs.mergeMap(event => processMessage(event.data).pipe(rxjs.catchError(err => rxjs.of({
+        type: 'receive-error',
+        message: event.data,
+        error: err
+    })))), rxjs.share());
+    const keepAlive$ = rxjs.defer(() => {
+        if (opts.keepAlive) {
+            return con.keepAlive(opts.keepAlive.pingInterval, opts.keepAlive.pongTimeout).pipe(rxjs.ignoreElements(), rxjs.catchError(err => {
                 con.terminate();
                 return rxjs.of({
                     type: 'keep-alive-error',
                     error: err
                 });
-            }))),
-        close$: con.close$,
-        close: con.close.bind(con),
-        debug: {
+            }));
+        }
+        else {
+            return rxjs.EMPTY;
+        }
+    }).pipe(rxjs.share());
+    rxjs.merge(send$, //this must come first so that it's subscribed before any send() call
+    receive$, doOnce$, keepAlive$).pipe(rxjs.takeUntil(con.close$)).subscribe();
+    //return the API
+    return {
+        _debug: {
             con
         },
-        advertise({ services, topics }) {
+        request$: receive$.pipe(rxjs.filter(event => event?.type == 'service-request')),
+        error$: rxjs.merge(send$, receive$.pipe(rxjs.filter(event => event?.type == 'receive-error')), doOnce$, keepAlive$, con.error$.pipe(rxjs.map(event => ({
+            type: 'socket-error',
+            error: event.error
+        })))),
+        close$: con.close$,
+        close: con.close.bind(con),
+        advertise({ services, topics, authToken }) {
             return sendReq({
                 header: {
                     type: "SbAdvertiseRequest",
@@ -170,23 +182,16 @@ function makeClient(con, waitEndpoints, { authToken, keepAlive, streamingChunkSi
             return onServiceResponse(msg);
     }
     function onServiceRequest(req) {
-        return rxjs.defer(() => {
-            if (handle) {
-                const result = handle(req);
-                return rxjs.isObservable(result) ? result.pipe(rxjs.first(null, undefined)) : rxjs.of(result);
-            }
-            else {
-                return rxjs.throwError(() => 'No service');
-            }
-        }).pipe(rxjs.map(res => res ?? {}), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
+        const responseSubject = new rxjs.Subject();
+        return rxjs.merge(rxjs.of({ type: 'service-request', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60 * 1000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
             header: {
-                ...res.header,
+                ...res?.header,
                 ...reservedFields,
                 to: req.header.from,
                 id: req.header.id,
                 type: "ServiceResponse"
             },
-            payload: res.payload
+            payload: res?.payload
         }), rxjs.EMPTY)), rxjs.catchError(err => rxjs.iif(() => req.header.id != null, send({
             header: {
                 to: req.header.from,
@@ -194,7 +199,7 @@ function makeClient(con, waitEndpoints, { authToken, keepAlive, streamingChunkSi
                 type: "ServiceResponse",
                 error: err instanceof Error ? err.message : String(err)
             }
-        }), rxjs.throwError(() => new Error('Potentially silent error thrown by notification handler', { cause: err })))));
+        }), rxjs.throwError(() => new Error('Potentially silent error thrown by notification handler', { cause: err })))), rxjs.ignoreElements()));
     }
     function onServiceResponse(msg) {
         const pending = pendingResponses.get(msg.header.id);
