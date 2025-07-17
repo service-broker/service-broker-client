@@ -1,5 +1,4 @@
 import { Connection, connect as connectWebSocket } from "@service-broker/websocket";
-import assert from "assert";
 import * as rxjs from "rxjs";
 import { PassThrough, Readable } from "stream";
 import WebSocket from "ws";
@@ -17,18 +16,6 @@ export interface MessageWithHeader extends Message {
 
 export type ServiceBroker = ReturnType<typeof makeClient>
 
-interface ProvidedService {
-  name: string
-  capabilities?: string[]
-  priority?: number
-}
-
-interface Provider {
-  service: ProvidedService
-  handler(req: MessageWithHeader): Message | void | Promise<Message | void>
-  advertise: boolean
-}
-
 const reservedFields: Record<string, void> = {
   from: undefined,
   to: undefined,
@@ -44,9 +31,6 @@ function* makeIdGen(): Generator<string, never> {
   while (true) yield String(++i)
 }
 
-function assertRecord(value: object): asserts value is Record<string, unknown> {
-}
-
 
 
 export interface ConnectOptions {
@@ -56,6 +40,7 @@ export interface ConnectOptions {
     pongTimeout: number
   },
   streamingChunkSize?: number
+  handle?: (request: MessageWithHeader) => void | Message | rxjs.Observable<void | Message>
 }
 
 type ErrorEvent = {
@@ -75,18 +60,16 @@ type ErrorEvent = {
 }
 
 export function connect(url: string, opts: ConnectOptions = {}) {
-  const providers = new Map<string, Provider>()
   const waitEndpoints = new Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>()
   return connectWebSocket(url).pipe(
-    rxjs.map(con => makeClient(con, providers, waitEndpoints, opts))
+    rxjs.map(con => makeClient(con, waitEndpoints, opts))
   )
 }
 
 function makeClient(
   con: Connection,
-  providers: Map<string, Provider>,
   waitEndpoints: Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>,
-  { authToken, keepAlive, streamingChunkSize }: ConnectOptions
+  { authToken, keepAlive, streamingChunkSize, handle }: ConnectOptions
 ) {
   const transmit = rxjs.bindNodeCallback(con.send).bind(con)
   const sendSubject = new rxjs.Subject<{ msg: MessageWithHeader, subscriber: rxjs.Subscriber<void> }>()
@@ -122,26 +105,6 @@ function makeClient(
           )
         )
       ),
-      //readvertise services on reconnect
-      rxjs.defer(() => {
-        const services = Array.from(providers.values())
-          .filter(x => x.advertise)
-          .map(x => x.service)
-        return rxjs.iif(
-          () => services.length > 0,
-          sendAdvertisement(services).pipe(
-            rxjs.ignoreElements(),
-            rxjs.catchError(err =>
-              rxjs.of<ErrorEvent>({
-                type: 'send-error',
-                message: { header: { type: 'SbAdvertiseRequest', services } },
-                error: err
-              })
-            )
-          ),
-          rxjs.EMPTY
-        )
-      }),
       //resend endpointWaitRequests on reconnect
       rxjs.defer(() =>
         rxjs.from(waitEndpoints.keys()).pipe(
@@ -203,49 +166,20 @@ function makeClient(
       con
     },
 
-    advertise(
-      service: { name: string, capabilities?: string[], priority?: number },
-      handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>
-    ) {
-      assert(!providers.has(service.name), `${service.name} provider already exists`)
-      return sendAdvertisement(
-        Array.from(providers.values())
-          .filter(x => x.advertise)
-          .map(x => x.service)
-          .concat(service)
-      ).pipe(
-        rxjs.tap(() => {
-          providers.set(service.name, {
-            service,
-            handler,
-            advertise: true
-          })
-        })
-      )
-    },
-
-    unadvertise(serviceName: string) {
-      assert(providers.has(serviceName), `${serviceName} provider not exists`)
-      return sendAdvertisement(
-        Array.from(providers.values())
-          .filter(x => x.advertise && x.service.name != serviceName)
-          .map(x => x.service)
-      ).pipe(
-        rxjs.tap(() => {
-          providers.delete(serviceName)
-        })
-      )
-    },
-
-    setServiceHandler(
-      serviceName: string,
-      handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>
-    ) {
-      assert(!providers.has(serviceName), `${serviceName} provider already exists`)
-      providers.set(serviceName, {
-        service: { name: serviceName },
-        handler,
-        advertise: false
+    advertise({ services, topics }: {
+      services: { name: string, capabilities?: string[], priority?: number }[],
+      topics: { name: string, capabilities?: string[] }[],
+    }) {
+      return sendReq({
+        header: {
+          type: "SbAdvertiseRequest",
+          authToken
+        },
+        payload: JSON.stringify(
+          services.concat(
+            topics.map(({ name, capabilities }) => ({ name: '#' + name, capabilities }))
+          )
+        )
       })
     },
 
@@ -258,7 +192,6 @@ function makeClient(
         header: {
           ...req.header,
           ...reservedFields,
-          type: "ServiceRequest",
           service
         },
         payload: req.payload
@@ -273,7 +206,6 @@ function makeClient(
         header: {
           ...msg.header,
           ...reservedFields,
-          type: "ServiceRequest",
           service
         },
         payload: msg.payload
@@ -291,7 +223,6 @@ function makeClient(
           ...req.header,
           ...reservedFields,
           to: endpointId,
-          type: "ServiceRequest",
           service: { name: serviceName }
         },
         payload: req.payload
@@ -308,7 +239,6 @@ function makeClient(
           ...msg.header,
           ...reservedFields,
           to: endpointId,
-          type: "ServiceRequest",
           service: { name: serviceName }
         },
         payload: msg.payload
@@ -318,22 +248,10 @@ function makeClient(
     publish(topic: string, text: string) {
       return send({
         header: {
-          type: "ServiceRequest",
           service: { name: "#" + topic }
         },
         payload: text
       })
-    },
-
-    subscribe(topic: string, handler: (text: string) => void) {
-      return this.advertise(
-        { name: "#" + topic },
-        msg => handler(msg.payload as string)
-      )
-    },
-
-    unsubscribe(topic: string) {
-      return this.unadvertise("#" + topic)
     },
 
     status() {
@@ -375,36 +293,21 @@ function makeClient(
 
 
 
-  function sendAdvertisement(services: ProvidedService[]) {
-    return sendReq({
-      header: {
-        authToken,
-        type: "SbAdvertiseRequest"
-      },
-      payload: JSON.stringify(services)
-    })
-  }
-
   function processMessage(data: unknown): rxjs.Observable<void> {
     const msg = deserialize(data)
-    if (msg.header.type == "ServiceRequest") return onServiceRequest(msg)
-    else if (msg.header.type == "ServiceResponse") return onServiceResponse(msg)
-    else if (msg.header.type == "SbAdvertiseResponse") return onServiceResponse(msg)
-    else if (msg.header.type == "SbStatusResponse") return onServiceResponse(msg)
-    else if (msg.header.type == "SbEndpointWaitResponse") return onEndpointWaitResponse(msg)
-    else if (msg.header.error) return onServiceResponse(msg)
+    if (msg.header.type == "SbEndpointWaitResponse") return onEndpointWaitResponse(msg)
     else if (msg.header.service) return onServiceRequest(msg)
-    else throw new Error("Don't know what to do with message")
+    else return onServiceResponse(msg)
   }
 
   function onServiceRequest(req: MessageWithHeader): rxjs.Observable<void> {
     return rxjs.defer(() => {
-      assert(typeof req.header.service == 'object' && req.header.service != null, 'BAD_REQUEST')
-      assertRecord(req.header.service)
-      assert(typeof req.header.service.name == 'string', 'BAD_REQUEST')
-      const provider = providers.get(req.header.service.name)
-      assert(provider, "NO_PROVIDER " + req.header.service.name)
-      return Promise.resolve(provider.handler(req))
+      if (handle) {
+        const result = handle(req)
+        return rxjs.isObservable(result) ? result.pipe(rxjs.first(null, undefined)) : rxjs.of(result)
+      } else {
+        return rxjs.throwError(() => 'No service')
+      }
     }).pipe(
       rxjs.map(res => res ?? {}),
       rxjs.exhaustMap(res =>

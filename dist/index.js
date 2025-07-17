@@ -1,5 +1,4 @@
 import { connect as connectWebSocket } from "@service-broker/websocket";
-import assert from "assert";
 import * as rxjs from "rxjs";
 import { PassThrough } from "stream";
 import { deserialize, serialize } from "./serialize.js";
@@ -17,14 +16,11 @@ function* makeIdGen() {
     while (true)
         yield String(++i);
 }
-function assertRecord(value) {
-}
 export function connect(url, opts = {}) {
-    const providers = new Map();
     const waitEndpoints = new Map();
-    return connectWebSocket(url).pipe(rxjs.map(con => makeClient(con, providers, waitEndpoints, opts)));
+    return connectWebSocket(url).pipe(rxjs.map(con => makeClient(con, waitEndpoints, opts)));
 }
-function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, streamingChunkSize }) {
+function makeClient(con, waitEndpoints, { authToken, keepAlive, streamingChunkSize, handle }) {
     const transmit = rxjs.bindNodeCallback(con.send).bind(con);
     const sendSubject = new rxjs.Subject();
     const pendingIdGen = makeIdGen();
@@ -45,17 +41,6 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
             message: msg,
             error: err
         }))))), 
-        //readvertise services on reconnect
-        rxjs.defer(() => {
-            const services = Array.from(providers.values())
-                .filter(x => x.advertise)
-                .map(x => x.service);
-            return rxjs.iif(() => services.length > 0, sendAdvertisement(services).pipe(rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-                type: 'send-error',
-                message: { header: { type: 'SbAdvertiseRequest', services } },
-                error: err
-            }))), rxjs.EMPTY);
-        }), 
         //resend endpointWaitRequests on reconnect
         rxjs.defer(() => rxjs.from(waitEndpoints.keys()).pipe(rxjs.concatMap(endpointId => send({
             header: {
@@ -87,33 +72,13 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
         debug: {
             con
         },
-        advertise(service, handler) {
-            assert(!providers.has(service.name), `${service.name} provider already exists`);
-            return sendAdvertisement(Array.from(providers.values())
-                .filter(x => x.advertise)
-                .map(x => x.service)
-                .concat(service)).pipe(rxjs.tap(() => {
-                providers.set(service.name, {
-                    service,
-                    handler,
-                    advertise: true
-                });
-            }));
-        },
-        unadvertise(serviceName) {
-            assert(providers.has(serviceName), `${serviceName} provider not exists`);
-            return sendAdvertisement(Array.from(providers.values())
-                .filter(x => x.advertise && x.service.name != serviceName)
-                .map(x => x.service)).pipe(rxjs.tap(() => {
-                providers.delete(serviceName);
-            }));
-        },
-        setServiceHandler(serviceName, handler) {
-            assert(!providers.has(serviceName), `${serviceName} provider already exists`);
-            providers.set(serviceName, {
-                service: { name: serviceName },
-                handler,
-                advertise: false
+        advertise({ services, topics }) {
+            return sendReq({
+                header: {
+                    type: "SbAdvertiseRequest",
+                    authToken
+                },
+                payload: JSON.stringify(services.concat(topics.map(({ name, capabilities }) => ({ name: '#' + name, capabilities }))))
             });
         },
         request(service, req, timeout) {
@@ -121,7 +86,6 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
                 header: {
                     ...req.header,
                     ...reservedFields,
-                    type: "ServiceRequest",
                     service
                 },
                 payload: req.payload
@@ -132,7 +96,6 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
                 header: {
                     ...msg.header,
                     ...reservedFields,
-                    type: "ServiceRequest",
                     service
                 },
                 payload: msg.payload
@@ -144,7 +107,6 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
                     ...req.header,
                     ...reservedFields,
                     to: endpointId,
-                    type: "ServiceRequest",
                     service: { name: serviceName }
                 },
                 payload: req.payload
@@ -156,7 +118,6 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
                     ...msg.header,
                     ...reservedFields,
                     to: endpointId,
-                    type: "ServiceRequest",
                     service: { name: serviceName }
                 },
                 payload: msg.payload
@@ -165,17 +126,10 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
         publish(topic, text) {
             return send({
                 header: {
-                    type: "ServiceRequest",
                     service: { name: "#" + topic }
                 },
                 payload: text
             });
-        },
-        subscribe(topic, handler) {
-            return this.advertise({ name: "#" + topic }, msg => handler(msg.payload));
-        },
-        unsubscribe(topic) {
-            return this.unadvertise("#" + topic);
         },
         status() {
             return sendReq({
@@ -206,42 +160,24 @@ function makeClient(con, providers, waitEndpoints, { authToken, keepAlive, strea
             return waiter.close$;
         }
     };
-    function sendAdvertisement(services) {
-        return sendReq({
-            header: {
-                authToken,
-                type: "SbAdvertiseRequest"
-            },
-            payload: JSON.stringify(services)
-        });
-    }
     function processMessage(data) {
         const msg = deserialize(data);
-        if (msg.header.type == "ServiceRequest")
-            return onServiceRequest(msg);
-        else if (msg.header.type == "ServiceResponse")
-            return onServiceResponse(msg);
-        else if (msg.header.type == "SbAdvertiseResponse")
-            return onServiceResponse(msg);
-        else if (msg.header.type == "SbStatusResponse")
-            return onServiceResponse(msg);
-        else if (msg.header.type == "SbEndpointWaitResponse")
+        if (msg.header.type == "SbEndpointWaitResponse")
             return onEndpointWaitResponse(msg);
-        else if (msg.header.error)
-            return onServiceResponse(msg);
         else if (msg.header.service)
             return onServiceRequest(msg);
         else
-            throw new Error("Don't know what to do with message");
+            return onServiceResponse(msg);
     }
     function onServiceRequest(req) {
         return rxjs.defer(() => {
-            assert(typeof req.header.service == 'object' && req.header.service != null, 'BAD_REQUEST');
-            assertRecord(req.header.service);
-            assert(typeof req.header.service.name == 'string', 'BAD_REQUEST');
-            const provider = providers.get(req.header.service.name);
-            assert(provider, "NO_PROVIDER " + req.header.service.name);
-            return Promise.resolve(provider.handler(req));
+            if (handle) {
+                const result = handle(req);
+                return rxjs.isObservable(result) ? result.pipe(rxjs.first(null, undefined)) : rxjs.of(result);
+            }
+            else {
+                return rxjs.throwError(() => 'No service');
+            }
         }).pipe(rxjs.map(res => res ?? {}), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
             header: {
                 ...res.header,

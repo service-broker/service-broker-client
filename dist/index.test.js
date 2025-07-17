@@ -31,13 +31,25 @@ function makeQueue() {
         take(type) {
             assert(queue.length > 0, 'queueEmpty');
             const item = queue.shift();
-            expect(item.type, type);
+            try {
+                expect(item.type, type);
+            }
+            catch (err) {
+                console.log(item.value);
+                throw err;
+            }
             return item.value;
         },
         async wait(type) {
             assert(queue.length == 0, '!queueEmpty');
             const item = await new Promise(f => waiters.push(f));
-            expect(item.type, type);
+            try {
+                expect(item.type, type);
+            }
+            catch (err) {
+                console.log(item.value);
+                throw err;
+            }
             return item.value;
         }
     };
@@ -60,23 +72,15 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     test('auth-token-fail', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const sb = await queue.wait('ServiceBroker');
-        await lvf(sb.advertise({ name: 'echo' }, () => { }))
+        await lvf(sb.advertise({ services: [{ name: 'echo' }], topics: [] }))
             .then(() => Promise.reject(new Error('!throwAsExpected')), err => expect(err.message, 'FORBIDDEN'));
-    });
-    test('reconnect-readvertise', async () => {
-        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken }));
-        let sb = await queue.wait('ServiceBroker');
-        await lvf(sb.advertise({ name: 'hello' }, req => ({ payload: 'Hello, ' + req.payload }))),
-            sb.debug.con.close();
-        sb = await queue.wait('ServiceBroker');
-        expect(await lvf(sb.request({ name: 'hello' }, { payload: 'John' })), { header: valueOfType('object'), payload: 'Hello, John' });
     });
     test('wait-endpoint', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const client = await queue.wait('ServiceBroker');
-        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken }));
+        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, handle: req => queue.push('Request', req) }));
         const provider = await queue.wait('ServiceBroker');
-        await lvf(provider.advertise({ name: 'hello' }, req => queue.push('Request', req)));
+        await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [] }));
         await lvf(client.request({ name: 'hello' }, { payload: 'text' }));
         const req = queue.take('Request');
         expect(req.payload, 'text');
@@ -89,9 +93,9 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     test('reconnect-wait-endpoint', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const client = await queue.wait('ServiceBroker');
-        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, repeatConfig: {} }));
+        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, handle: req => queue.push('Request', req) }));
         let provider = await queue.wait('ServiceBroker');
-        await lvf(provider.advertise({ name: 'hello' }, req => queue.push('Request', req)));
+        await lvf(provider.advertise({ services: [{ name: 'hello' }], topics: [] }));
         await lvf(client.request({ name: 'hello' }, { payload: 'text' }));
         const req = queue.take('Request');
         expect(req.payload, 'text');
@@ -105,7 +109,8 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     });
     test('keep-alive', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue, { keepAlive: { pingInterval: 250, pongTimeout: 100 } }));
-        const client = await queue.wait('ServiceBroker');
+        await queue.wait('ServiceBroker');
+        console.log('This test requires autoPong to be disabled on the Service Broker');
         expect(await queue.wait('ErrorEvent'), {
             type: 'keep-alive-error',
             error: new Expectation('instanceOf', 'TimeoutError', actual => assert(actual instanceof rxjs.TimeoutError))
@@ -127,13 +132,20 @@ describe('pub-sub', ({ beforeEach, afterEach, test }) => {
             sub.unsubscribe();
     });
     test("basic", async () => {
-        subs.push(sbConnect(serviceBrokerUrl, queue));
+        subs.push(sbConnect(serviceBrokerUrl, queue, { handle: req => queue.push('Message', req) }));
         const subscriber = await queue.wait('ServiceBroker');
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const publisher = await queue.wait('ServiceBroker');
-        await lvf(subscriber.subscribe("test-log", msg => queue.push('Message', msg)));
+        await lvf(subscriber.advertise({ services: [], topics: [{ name: "test-log" }] }));
         await lvf(publisher.publish("test-log", "what in the world"));
-        expect(await queue.wait('Message'), "what in the world");
+        expect(await queue.wait('Message'), {
+            header: {
+                from: valueOfType('string'),
+                ip: localIp,
+                service: { name: '#test-log' }
+            },
+            payload: "what in the world"
+        });
     });
 });
 describe("service", ({ beforeEach, afterEach, test }) => {
@@ -150,22 +162,27 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     test("request-response", async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const client = await queue.wait('ServiceBroker');
-        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken }));
+        subs.push(sbConnect(serviceBrokerUrl, queue, {
+            authToken,
+            handle: req => new rxjs.Observable(sub => queue.push('Request', { req, sub }))
+        }));
         const provider = await queue.wait('ServiceBroker');
         //advertise
-        await lvf(provider.advertise({ name: "test-tts", capabilities: ["v1", "v2"], priority: 1 }, req => new Promise(f => queue.push('Request', { req, reply: f }))));
+        await lvf(provider.advertise({
+            services: [{ name: "test-tts", capabilities: ["v1", "v2"], priority: 1 }],
+            topics: []
+        }));
         //request
         let promise = lvf(client.request({ name: "test-tts", capabilities: ["v1"] }, {
             header: { lang: "vi" },
             payload: "this is request payload"
         }));
-        let { req, reply } = await queue.wait('Request');
+        let { req, sub } = await queue.wait('Request');
         expect(req, {
             header: {
                 from: valueOfType('string'),
                 id: valueOfType('string'),
                 ip: localIp,
-                type: "ServiceRequest",
                 service: {
                     name: "test-tts",
                     capabilities: ["v1"]
@@ -175,7 +192,7 @@ describe("service", ({ beforeEach, afterEach, test }) => {
             payload: "this is request payload"
         });
         //respond
-        reply({
+        sub.next({
             header: { result: 1 },
             payload: Buffer.from("this is response payload")
         });
@@ -192,27 +209,24 @@ describe("service", ({ beforeEach, afterEach, test }) => {
         });
         const clientEndpointId = req.header.from;
         const providerEndpointId = res.header.from;
-        //setServiceHandler
-        provider.setServiceHandler("test-direct", req => new Promise(f => queue.push('Request', { req, reply: f })));
         //requestTo
         promise = lvf(client.requestTo(providerEndpointId, "test-direct", {
             header: { value: 100 },
             payload: "Direct request payload"
         }));
-        ({ req, reply } = await queue.wait('Request'));
+        ({ req, sub } = await queue.wait('Request'));
         expect(req, {
             header: {
                 from: clientEndpointId,
                 to: providerEndpointId,
                 id: valueOfType('string'),
-                type: "ServiceRequest",
                 service: { name: "test-direct" },
                 value: 100
             },
             payload: "Direct request payload"
         });
         //respond
-        reply({
+        sub.next({
             header: { output: "crap" },
             payload: Buffer.from("Direct response payload")
         });
@@ -231,20 +245,19 @@ describe("service", ({ beforeEach, afterEach, test }) => {
             header: { value: 200 },
             payload: Buffer.from("Direct notify payload")
         }));
-        ({ req, reply } = await queue.wait('Request'));
+        ({ req, sub } = await queue.wait('Request'));
         expect(req, {
             header: {
                 from: clientEndpointId,
                 to: providerEndpointId,
-                type: "ServiceRequest",
                 service: { name: "test-direct" },
                 value: 200
             },
             payload: Buffer.from("Direct notify payload")
         });
-        reply({});
+        sub.next({});
         //unadvertise
-        await lvf(provider.unadvertise('test-tts'));
+        await lvf(provider.advertise({ services: [], topics: [] }));
         //request fail no provider
         await lvf(client.request({ name: "test-tts", capabilities: ["v1"] }, {
             header: { lang: "en" },
@@ -254,18 +267,22 @@ describe("service", ({ beforeEach, afterEach, test }) => {
     test('streaming', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));
         const client = await queue.wait('ServiceBroker');
-        subs.push(sbConnect(serviceBrokerUrl, queue, { authToken, streamingChunkSize: 10 }));
-        const provider = await queue.wait('ServiceBroker');
-        await lvf(provider.advertise({ name: 'tts' }, msg => {
-            assert(msg.payload == 'stream request');
-            const stream = new PassThrough();
-            const chunks = ['abcdefghijkl', 'mnop', 'qrstuvwxyz1234567890'];
-            rxjs.from(chunks).pipe(rxjs.concatMap(chunk => rxjs.of(chunk).pipe(rxjs.concatWith(rxjs.timer(100).pipe(rxjs.ignoreElements()))))).subscribe({
-                next: chunk => stream.write(Buffer.from(chunk)),
-                complete: () => stream.end()
-            });
-            return { payload: stream };
+        subs.push(sbConnect(serviceBrokerUrl, queue, {
+            authToken,
+            streamingChunkSize: 10,
+            handle(msg) {
+                assert(msg.payload == 'stream request');
+                const stream = new PassThrough();
+                const chunks = ['abcdefghijkl', 'mnop', 'qrstuvwxyz1234567890'];
+                rxjs.from(chunks).pipe(rxjs.concatMap(chunk => rxjs.of(chunk).pipe(rxjs.concatWith(rxjs.timer(100).pipe(rxjs.ignoreElements()))))).subscribe({
+                    next: chunk => stream.write(Buffer.from(chunk)),
+                    complete: () => stream.end()
+                });
+                return { payload: stream };
+            }
         }));
+        const provider = await queue.wait('ServiceBroker');
+        await lvf(provider.advertise({ services: [{ name: 'tts' }], topics: [] }));
         const res = await lvf(client.request({ name: 'tts' }, { payload: 'stream request' }));
         assert(res.payload instanceof Readable);
         expect(await lvf(rxjs.fromEvent(res.payload, 'data').pipe(rxjs.takeUntil(rxjs.fromEvent(res.payload, 'end')), rxjs.buffer(rxjs.NEVER))), [

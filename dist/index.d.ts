@@ -10,16 +10,6 @@ export interface MessageWithHeader extends Message {
     header: Record<string, unknown>;
 }
 export type ServiceBroker = ReturnType<typeof makeClient>;
-interface ProvidedService {
-    name: string;
-    capabilities?: string[];
-    priority?: number;
-}
-interface Provider {
-    service: ProvidedService;
-    handler(req: MessageWithHeader): Message | void | Promise<Message | void>;
-    advertise: boolean;
-}
 export interface ConnectOptions {
     authToken?: string;
     keepAlive?: {
@@ -27,6 +17,7 @@ export interface ConnectOptions {
         pongTimeout: number;
     };
     streamingChunkSize?: number;
+    handle?: (request: MessageWithHeader) => void | Message | rxjs.Observable<void | Message>;
 }
 type ErrorEvent = {
     type: 'send-error';
@@ -50,13 +41,17 @@ export declare function connect(url: string, opts?: ConnectOptions): rxjs.Observ
     debug: {
         con: Connection;
     };
-    advertise(service: {
-        name: string;
-        capabilities?: string[];
-        priority?: number;
-    }, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): rxjs.Observable<MessageWithHeader>;
-    unadvertise(serviceName: string): rxjs.Observable<MessageWithHeader>;
-    setServiceHandler(serviceName: string, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): void;
+    advertise({ services, topics }: {
+        services: {
+            name: string;
+            capabilities?: string[];
+            priority?: number;
+        }[];
+        topics: {
+            name: string;
+            capabilities?: string[];
+        }[];
+    }): rxjs.Observable<MessageWithHeader>;
     request(service: {
         name: string;
         capabilities?: string[];
@@ -68,29 +63,31 @@ export declare function connect(url: string, opts?: ConnectOptions): rxjs.Observ
     requestTo(endpointId: string, serviceName: string, req: Message, timeout?: number): rxjs.Observable<MessageWithHeader>;
     notifyTo(endpointId: string, serviceName: string, msg: Message): rxjs.Observable<void>;
     publish(topic: string, text: string): rxjs.Observable<void>;
-    subscribe(topic: string, handler: (text: string) => void): rxjs.Observable<MessageWithHeader>;
-    unsubscribe(topic: string): rxjs.Observable<MessageWithHeader>;
     status(): rxjs.Observable<any>;
     cleanup(): rxjs.Observable<void>;
     waitEndpoint(endpointId: string): rxjs.Observable<void>;
 }>;
-declare function makeClient(con: Connection, providers: Map<string, Provider>, waitEndpoints: Map<string, {
+declare function makeClient(con: Connection, waitEndpoints: Map<string, {
     closeSubject: rxjs.Subject<void>;
     close$: rxjs.Observable<void>;
-}>, { authToken, keepAlive, streamingChunkSize }: ConnectOptions): {
+}>, { authToken, keepAlive, streamingChunkSize, handle }: ConnectOptions): {
     event$: rxjs.Observable<ErrorEvent>;
     close$: rxjs.Observable<WebSocket.CloseEvent>;
     close: (code?: number, data?: string | Buffer) => void;
     debug: {
         con: Connection;
     };
-    advertise(service: {
-        name: string;
-        capabilities?: string[];
-        priority?: number;
-    }, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): rxjs.Observable<MessageWithHeader>;
-    unadvertise(serviceName: string): rxjs.Observable<MessageWithHeader>;
-    setServiceHandler(serviceName: string, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): void;
+    advertise({ services, topics }: {
+        services: {
+            name: string;
+            capabilities?: string[];
+            priority?: number;
+        }[];
+        topics: {
+            name: string;
+            capabilities?: string[];
+        }[];
+    }): rxjs.Observable<MessageWithHeader>;
     request(service: {
         name: string;
         capabilities?: string[];
@@ -102,8 +99,6 @@ declare function makeClient(con: Connection, providers: Map<string, Provider>, w
     requestTo(endpointId: string, serviceName: string, req: Message, timeout?: number): rxjs.Observable<MessageWithHeader>;
     notifyTo(endpointId: string, serviceName: string, msg: Message): rxjs.Observable<void>;
     publish(topic: string, text: string): rxjs.Observable<void>;
-    subscribe(topic: string, handler: (text: string) => void): rxjs.Observable<MessageWithHeader>;
-    unsubscribe(topic: string): rxjs.Observable<MessageWithHeader>;
     status(): rxjs.Observable<any>;
     cleanup(): rxjs.Observable<void>;
     waitEndpoint(endpointId: string): rxjs.Observable<void>;
