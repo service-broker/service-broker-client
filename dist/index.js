@@ -37,7 +37,7 @@ function makeClient(con, waitEndpoints, opts) {
     })))), rxjs.share());
     const doOnce$ = rxjs.merge(
     //resend endpointWaitRequests on reconnect
-    rxjs.defer(() => rxjs.from(waitEndpoints.keys()).pipe(rxjs.concatMap(endpointId => send({
+    rxjs.defer(() => rxjs.from(waitEndpoints.keys())).pipe(rxjs.concatMap(endpointId => send({
         header: {
             type: "SbEndpointWaitRequest",
             endpointId
@@ -46,7 +46,7 @@ function makeClient(con, waitEndpoints, opts) {
         type: 'error',
         error: err,
         detail: { method: 'waitEndpoint' }
-    }))))).pipe(rxjs.share());
+    })))).pipe(rxjs.share());
     const receive$ = con.message$.pipe(rxjs.mergeMap(event => processMessage(event.data).pipe(rxjs.catchError(err => rxjs.of({
         type: 'error',
         error: err,
@@ -179,7 +179,7 @@ function makeClient(con, waitEndpoints, opts) {
     }
     function onServiceRequest(req) {
         const responseSubject = new rxjs.Subject();
-        return rxjs.merge(rxjs.of({ type: 'service', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60 * 1000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
+        return rxjs.merge(rxjs.of({ type: 'service', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60_000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
             header: {
                 ...res?.header,
                 ...reservedFields,
@@ -195,7 +195,7 @@ function makeClient(con, waitEndpoints, opts) {
                 type: "ServiceResponse",
                 error: err instanceof Error ? err.message : String(err)
             }
-        }), rxjs.throwError(() => new Error('Potentially silent error thrown by notification handler', { cause: err })))), rxjs.ignoreElements()));
+        }), rxjs.throwError(() => new Error('Unhandled error thrown by notification handler', { cause: err })))), rxjs.ignoreElements()));
     }
     function onServiceResponse(msg) {
         const pending = pendingResponses.get(msg.header.id);
@@ -204,7 +204,7 @@ function makeClient(con, waitEndpoints, opts) {
             return rxjs.EMPTY;
         }
         else {
-            throw new Error("Response received but no pending request");
+            throw new Error("Stray ServiceResponse");
         }
     }
     function onEndpointWaitResponse(msg) {
@@ -223,7 +223,7 @@ function makeClient(con, waitEndpoints, opts) {
             sendSubject.next({ msg, subscriber });
         });
     }
-    function sendReq(msg, timeout = 30000) {
+    function sendReq(msg, timeout = 30_000) {
         return rxjs.defer(() => {
             const id = pendingIdGen.next().value;
             msg.header.id = id;
@@ -233,7 +233,7 @@ function makeClient(con, waitEndpoints, opts) {
             })), rxjs.share(), src$ => src$.pipe(rxjs.first(), timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout), rxjs.exhaustMap(res => rxjs.iif(() => !!res.header.part, rxjs.defer(() => {
                 const stream = new PassThrough();
                 const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream);
-                return src$.pipe(rxjs.startWith(res), rxjs.takeWhile(msg => !!msg.header.part, true), rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY), rxjs.finalize(() => stream.end()), rxjs.ignoreElements(), rxjs.startWith({ header: res.header, payload: stream }));
+                return src$.pipe(rxjs.timeout(60_000), rxjs.startWith(res), rxjs.takeWhile(msg => !!msg.header.part, true), rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY), rxjs.finalize(() => stream.end()), rxjs.ignoreElements(), rxjs.startWith({ header: res.header, payload: stream }));
             }), rxjs.iif(() => !!res.header.error, rxjs.throwError(() => typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error), rxjs.of(res)))), rxjs.share({ resetOnRefCountZero: false })));
         });
     }

@@ -132,24 +132,22 @@ function makeClient(
 
   const doOnce$ = rxjs.merge(
     //resend endpointWaitRequests on reconnect
-    rxjs.defer(() =>
-      rxjs.from(waitEndpoints.keys()).pipe(
-        rxjs.concatMap(endpointId =>
-          send({
-            header: {
-              type: "SbEndpointWaitRequest",
-              endpointId
-            }
-          })
-        ),
-        rxjs.ignoreElements(),
-        rxjs.catchError(err =>
-          rxjs.of<ErrorEvent>({
-            type: 'error',
-            error: err,
-            detail: { method: 'waitEndpoint' }
-          })
-        )
+    rxjs.defer(() => rxjs.from(waitEndpoints.keys())).pipe(
+      rxjs.concatMap(endpointId =>
+        send({
+          header: {
+            type: "SbEndpointWaitRequest",
+            endpointId
+          }
+        })
+      ),
+      rxjs.ignoreElements(),
+      rxjs.catchError(err =>
+        rxjs.of<ErrorEvent>({
+          type: 'error',
+          error: err,
+          detail: { method: 'waitEndpoint' }
+        })
       )
     )
   ).pipe(
@@ -351,7 +349,7 @@ function makeClient(
       rxjs.of<ServiceEvent>({ type: 'service', request: req, responseSubject }),
       responseSubject.pipe(
         rxjs.first(null, undefined),
-        rxjs.timeout(60*1000),
+        rxjs.timeout(60_000),
         rxjs.exhaustMap(res =>
           rxjs.iif(
             () => req.header.id != null,
@@ -380,7 +378,7 @@ function makeClient(
               }
             }),
             rxjs.throwError(() =>
-              new Error('Potentially silent error thrown by notification handler', { cause: err })
+              new Error('Unhandled error thrown by notification handler', { cause: err })
             )
           )
         ),
@@ -395,7 +393,7 @@ function makeClient(
       pending.next(msg)
       return rxjs.EMPTY
     } else {
-      throw new Error("Response received but no pending request")
+      throw new Error("Stray ServiceResponse")
     }
   }
 
@@ -418,7 +416,7 @@ function makeClient(
     })
   }
 
-  function sendReq(msg: MessageWithHeader, timeout = 30000): rxjs.Observable<MessageWithHeader> {
+  function sendReq(msg: MessageWithHeader, timeout = 30_000): rxjs.Observable<MessageWithHeader> {
     return rxjs.defer(() => {
       const id = pendingIdGen.next().value
       msg.header.id = id
@@ -440,6 +438,7 @@ function makeClient(
                 const stream = new PassThrough()
                 const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream)
                 return src$.pipe(
+                  rxjs.timeout(60_000),
                   rxjs.startWith(res),
                   rxjs.takeWhile(msg => !!msg.header.part, true),
                   rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY),
