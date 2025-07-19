@@ -3,7 +3,7 @@ import assert from "assert"
 import dotenv from "dotenv"
 import * as rxjs from "rxjs"
 import { PassThrough, Readable } from "stream"
-import { connect, ConnectOptions, Message, MessageWithHeader, ServiceBroker, ServiceEvent } from "./index.js"
+import { ClientOptions, connect, Client as ServiceBroker, ServiceEvent } from "./index.js"
 
 dotenv.config({ quiet: true })
 
@@ -19,7 +19,7 @@ function lvf<T>(v$: rxjs.Observable<T>) {
   return rxjs.lastValueFrom(v$)
 }
 
-function sbConnect(url: string, queue: ReturnType<typeof makeQueue>, opts?: ConnectOptions) {
+function sbConnect(url: string, queue: ReturnType<typeof makeQueue>, opts?: ClientOptions) {
   return connect(url, opts).pipe(
     rxjs.exhaustMap(sb => {
       queue.push('ServiceBroker', sb)
@@ -125,7 +125,7 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0))
 
     await new Promise(f => setTimeout(f, 100))
-    client._debug.con.close()
+    client.close()
     await queue.wait('CloseEvent')
     await queue.wait('disconnect')
   })
@@ -145,10 +145,10 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0))
 
     await new Promise(f => setTimeout(f, 100))
-    provider._debug.con.close()
+    provider.close()
     await queue.wait('CloseEvent')
     provider = await queue.wait<ServiceBroker>('ServiceBroker')
-    client._debug.con.close()
+    client.close()
     await queue.wait('CloseEvent')
     await queue.wait('disconnect')
   })
@@ -158,8 +158,9 @@ describe('config', ({ beforeEach, afterEach, test }) => {
     await queue.wait<ServiceBroker>('ServiceBroker')
     console.log('This test requires autoPong to be disabled on the Service Broker')
     expect(await queue.wait('ErrorEvent'), {
-      type: 'keep-alive-error',
-      error: new Expectation('instanceOf', 'TimeoutError', actual => assert(actual instanceof rxjs.TimeoutError))
+      type: 'error',
+      error: new Expectation('instanceOf', 'TimeoutError', actual => assert(actual instanceof rxjs.TimeoutError)),
+      detail: { method: 'keepAlive' }
     })
   })
 

@@ -11,11 +11,6 @@ const reservedFields = {
     service: undefined,
     part: undefined
 };
-function* makeIdGen() {
-    let i = 0;
-    while (true)
-        yield String(++i);
-}
 export function connect(url, opts = {}) {
     const waitEndpoints = new Map();
     return connectWebSocket(url).pipe(rxjs.map(con => makeClient(con, waitEndpoints, opts)));
@@ -23,7 +18,8 @@ export function connect(url, opts = {}) {
 function makeClient(con, waitEndpoints, opts) {
     const transmit = rxjs.bindNodeCallback(con.send).bind(con);
     const sendSubject = new rxjs.Subject();
-    const pendingIdGen = makeIdGen();
+    const pendingIdGen = (function* () { let i = 0; while (true)
+        yield String(++i); })();
     const pendingResponses = new Map();
     //background activities
     const send$ = sendSubject.pipe(rxjs.concatMap(({ msg, subscriber }) => rxjs.defer(() => {
@@ -35,9 +31,9 @@ function makeClient(con, waitEndpoints, opts) {
             return transmit(data, {});
         }
     }).pipe(rxjs.tap(subscriber), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-        type: 'send-error',
-        message: msg,
-        error: err
+        type: 'error',
+        error: err,
+        detail: { method: 'send', message: msg }
     })))), rxjs.share());
     const doOnce$ = rxjs.merge(
     //resend endpointWaitRequests on reconnect
@@ -47,22 +43,28 @@ function makeClient(con, waitEndpoints, opts) {
             endpointId
         }
     })), rxjs.ignoreElements(), rxjs.catchError(err => rxjs.of({
-        type: 'send-error',
-        message: { header: { type: 'SbEndpointWaitRequest' } },
-        error: err
+        type: 'error',
+        error: err,
+        detail: { method: 'waitEndpoint' }
     }))))).pipe(rxjs.share());
     const receive$ = con.message$.pipe(rxjs.mergeMap(event => processMessage(event.data).pipe(rxjs.catchError(err => rxjs.of({
-        type: 'receive-error',
-        message: event.data,
-        error: err
+        type: 'error',
+        error: err,
+        detail: { method: 'receive', data: event.data }
     })))), rxjs.share());
+    const error$ = con.error$.pipe(rxjs.map((event) => ({
+        type: 'error',
+        error: event.error,
+        detail: { method: 'socketEvent' }
+    })), rxjs.share());
     const keepAlive$ = rxjs.defer(() => {
         if (opts.keepAlive) {
             return con.keepAlive(opts.keepAlive.pingInterval, opts.keepAlive.pongTimeout).pipe(rxjs.ignoreElements(), rxjs.catchError(err => {
                 con.terminate();
                 return rxjs.of({
-                    type: 'keep-alive-error',
-                    error: err
+                    type: 'error',
+                    error: err,
+                    detail: { method: 'keepAlive' }
                 });
             }));
         }
@@ -71,17 +73,11 @@ function makeClient(con, waitEndpoints, opts) {
         }
     }).pipe(rxjs.share());
     rxjs.merge(send$, //this must come first so that it's subscribed before any send() call
-    receive$, doOnce$, keepAlive$).pipe(rxjs.takeUntil(con.close$)).subscribe();
+    receive$, error$, doOnce$, keepAlive$).pipe(rxjs.takeUntil(con.close$)).subscribe();
     //return the API
     return {
-        _debug: {
-            con
-        },
-        request$: receive$.pipe(rxjs.filter(event => event?.type == 'service-request')),
-        error$: rxjs.merge(send$, receive$.pipe(rxjs.filter(event => event?.type == 'receive-error')), doOnce$, keepAlive$, con.error$.pipe(rxjs.map(event => ({
-            type: 'socket-error',
-            error: event.error
-        })))),
+        request$: receive$.pipe(rxjs.filter(event => event.type == 'service')),
+        error$: rxjs.merge(send$, receive$.pipe(rxjs.filter(event => event.type == 'error')), error$, doOnce$, keepAlive$),
         close$: con.close$,
         close: con.close.bind(con),
         advertise({ services, topics, authToken }) {
@@ -183,7 +179,7 @@ function makeClient(con, waitEndpoints, opts) {
     }
     function onServiceRequest(req) {
         const responseSubject = new rxjs.Subject();
-        return rxjs.merge(rxjs.of({ type: 'service-request', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60 * 1000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
+        return rxjs.merge(rxjs.of({ type: 'service', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60 * 1000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
             header: {
                 ...res?.header,
                 ...reservedFields,

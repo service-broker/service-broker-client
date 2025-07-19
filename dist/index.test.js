@@ -90,7 +90,7 @@ describe('config', ({ beforeEach, afterEach, test }) => {
         const clientEndpointId = request.header.from;
         provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0));
         await new Promise(f => setTimeout(f, 100));
-        client._debug.con.close();
+        client.close();
         await queue.wait('CloseEvent');
         await queue.wait('disconnect');
     });
@@ -107,10 +107,10 @@ describe('config', ({ beforeEach, afterEach, test }) => {
         const clientEndpointId = request.header.from;
         provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0));
         await new Promise(f => setTimeout(f, 100));
-        provider._debug.con.close();
+        provider.close();
         await queue.wait('CloseEvent');
         provider = await queue.wait('ServiceBroker');
-        client._debug.con.close();
+        client.close();
         await queue.wait('CloseEvent');
         await queue.wait('disconnect');
     });
@@ -119,8 +119,9 @@ describe('config', ({ beforeEach, afterEach, test }) => {
         await queue.wait('ServiceBroker');
         console.log('This test requires autoPong to be disabled on the Service Broker');
         expect(await queue.wait('ErrorEvent'), {
-            type: 'keep-alive-error',
-            error: new Expectation('instanceOf', 'TimeoutError', actual => assert(actual instanceof rxjs.TimeoutError))
+            type: 'error',
+            error: new Expectation('instanceOf', 'TimeoutError', actual => assert(actual instanceof rxjs.TimeoutError)),
+            detail: { method: 'keepAlive' }
         });
     });
     test('session-recovery', async () => {

@@ -14,8 +14,6 @@ export interface MessageWithHeader extends Message {
   header: Record<string, unknown>
 }
 
-export type ServiceBroker = ReturnType<typeof makeClient>
-
 const reservedFields: Record<string, void> = {
   from: undefined,
   to: undefined,
@@ -26,14 +24,9 @@ const reservedFields: Record<string, void> = {
   part: undefined
 };
 
-function* makeIdGen(): Generator<string, never> {
-  let i = 0
-  while (true) yield String(++i)
-}
 
 
-
-export interface ConnectOptions {
+export interface ClientOptions {
   keepAlive?: {
     pingInterval: number
     pongTimeout: number
@@ -41,30 +34,58 @@ export interface ConnectOptions {
   streamingChunkSize?: number
 }
 
-export type ServiceEvent = {
-  type: 'service-request'
+export interface Client {
+  request$: rxjs.Observable<ServiceEvent>
+  error$: rxjs.Observable<ErrorEvent>
+  close$: rxjs.Observable<WebSocket.CloseEvent>
+  close: WebSocket['close']
+  advertise(opts: {
+    services: { name: string, capabilities?: string[], priority?: number }[],
+    topics: { name: string, capabilities?: string[] }[],
+    authToken?: string
+  }): rxjs.Observable<MessageWithHeader>
+  request(
+    service: { name: string, capabilities?: string[] },
+    req: Message,
+    timeout?: number
+  ): rxjs.Observable<MessageWithHeader>
+  notify(
+    service: { name: string, capabilities?: string[] },
+    msg: Message
+  ): rxjs.Observable<void>
+  requestTo(
+    endpointId: string,
+    serviceName: string,
+    req: Message,
+    timeout?: number
+  ): rxjs.Observable<MessageWithHeader>
+  notifyTo(
+    endpointId: string,
+    serviceName: string,
+    msg: Message
+  ): rxjs.Observable<void>
+  publish(topic: string, text: string): rxjs.Observable<void>
+  status(): rxjs.Observable<unknown>
+  cleanup(): rxjs.Observable<void>
+  waitEndpoint(endpointId: string): rxjs.Observable<void>
+}
+
+export interface ServiceEvent {
+  type: 'service'
   request: MessageWithHeader
   responseSubject: rxjs.Subject<Message | void>
 }
 
-export type ErrorEvent = {
-  type: 'send-error'
-  message?: MessageWithHeader
+export interface ErrorEvent {
+  type: 'error'
   error: unknown
-} | {
-  type: 'receive-error'
-  message: WebSocket.Data
-  error: unknown
-} | {
-  type: 'keep-alive-error'
-  error: unknown
-} | {
-  type: 'socket-error'
-  error: unknown
+  detail: unknown
 }
 
-export function connect(url: string, opts: ConnectOptions = {}) {
-  const waitEndpoints = new Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>()
+
+
+export function connect(url: string, opts: ClientOptions = {}) {
+  const waitEndpoints: Parameters<typeof makeClient>[1] = new Map()
   return connectWebSocket(url).pipe(
     rxjs.map(con => makeClient(con, waitEndpoints, opts))
   )
@@ -73,11 +94,11 @@ export function connect(url: string, opts: ConnectOptions = {}) {
 function makeClient(
   con: Connection,
   waitEndpoints: Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>,
-  opts: ConnectOptions
-) {
+  opts: ClientOptions
+): Client {
   const transmit = rxjs.bindNodeCallback(con.send).bind(con)
   const sendSubject = new rxjs.Subject<{ msg: MessageWithHeader, subscriber: rxjs.Subscriber<void> }>()
-  const pendingIdGen = makeIdGen()
+  const pendingIdGen = (function*() { let i = 0; while (true) yield String(++i) })()
   const pendingResponses = new Map<string, rxjs.Subscriber<MessageWithHeader>>()
 
   //background activities
@@ -99,9 +120,9 @@ function makeClient(
         rxjs.ignoreElements(),
         rxjs.catchError(err =>
           rxjs.of<ErrorEvent>({
-            type: 'send-error',
-            message: msg,
-            error: err
+            type: 'error',
+            error: err,
+            detail: { method: 'send', message: msg }
           })
         )
       )
@@ -124,9 +145,9 @@ function makeClient(
         rxjs.ignoreElements(),
         rxjs.catchError(err =>
           rxjs.of<ErrorEvent>({
-            type: 'send-error',
-            message: { header: { type: 'SbEndpointWaitRequest' } },
-            error: err
+            type: 'error',
+            error: err,
+            detail: { method: 'waitEndpoint' }
           })
         )
       )
@@ -140,13 +161,22 @@ function makeClient(
       processMessage(event.data).pipe(
         rxjs.catchError(err =>
           rxjs.of<ErrorEvent>({
-            type: 'receive-error',
-            message: event.data,
-            error: err
+            type: 'error',
+            error: err,
+            detail: { method: 'receive', data: event.data }
           })
         )
       )
     ),
+    rxjs.share()
+  )
+
+  const error$ = con.error$.pipe(
+    rxjs.map((event): ErrorEvent => ({
+      type: 'error',
+      error: event.error,
+      detail: { method: 'socketEvent' }
+    })),
     rxjs.share()
   )
 
@@ -157,8 +187,9 @@ function makeClient(
         rxjs.catchError(err => {
           con.terminate()
           return rxjs.of<ErrorEvent>({
-            type: 'keep-alive-error',
-            error: err
+            type: 'error',
+            error: err,
+            detail: { method: 'keepAlive' }
           })
         })
       )
@@ -172,6 +203,7 @@ function makeClient(
   rxjs.merge(
     send$,    //this must come first so that it's subscribed before any send() call
     receive$,
+    error$,
     doOnce$,
     keepAlive$,
   ).pipe(
@@ -180,38 +212,25 @@ function makeClient(
 
   //return the API
   return {
-    _debug: {
-      con
-    },
-
     request$: receive$.pipe(
-      rxjs.filter(event => event?.type == 'service-request')
+      rxjs.filter(event => event.type == 'service')
     ),
 
     error$: rxjs.merge(
       send$,
       receive$.pipe(
-        rxjs.filter(event => event?.type == 'receive-error')
+        rxjs.filter(event => event.type == 'error')
       ),
+      error$,
       doOnce$,
       keepAlive$,
-      con.error$.pipe(
-        rxjs.map(event => ({
-          type: 'socket-error',
-          error: event.error
-        }) as ErrorEvent)
-      )
     ),
 
     close$: con.close$,
 
     close: con.close.bind(con),
 
-    advertise({ services, topics, authToken }: {
-      services: { name: string, capabilities?: string[], priority?: number }[],
-      topics: { name: string, capabilities?: string[] }[],
-      authToken?: string
-    }) {
+    advertise({ services, topics, authToken }) {
       return sendReq({
         header: {
           type: "SbAdvertiseRequest",
@@ -225,11 +244,7 @@ function makeClient(
       })
     },
 
-    request(
-      service: { name: string, capabilities?: string[] },
-      req: Message,
-      timeout?: number
-    ) {
+    request(service, req, timeout) {
       return sendReq({
         header: {
           ...req.header,
@@ -240,10 +255,7 @@ function makeClient(
       }, timeout)
     },
 
-    notify(
-      service: { name: string, capabilities?: string[] },
-      msg: Message
-    ) {
+    notify(service, msg) {
       return send({
         header: {
           ...msg.header,
@@ -254,12 +266,7 @@ function makeClient(
       })
     },
 
-    requestTo(
-      endpointId: string,
-      serviceName: string,
-      req: Message,
-      timeout?: number
-    ) {
+    requestTo(endpointId, serviceName, req, timeout) {
       return sendReq({
         header: {
           ...req.header,
@@ -271,11 +278,7 @@ function makeClient(
       }, timeout)
     },
 
-    notifyTo(
-      endpointId: string,
-      serviceName: string,
-      msg: Message
-    ) {
+    notifyTo(endpointId, serviceName, msg) {
       return send({
         header: {
           ...msg.header,
@@ -287,7 +290,7 @@ function makeClient(
       })
     },
 
-    publish(topic: string, text: string) {
+    publish(topic, text) {
       return send({
         header: {
           service: { name: "#" + topic }
@@ -312,7 +315,7 @@ function makeClient(
       })
     },
 
-    waitEndpoint(endpointId: string) {
+    waitEndpoint(endpointId) {
       let waiter = waitEndpoints.get(endpointId)
       if (!waiter) {
         const closeSubject = new rxjs.ReplaySubject<void>()
@@ -335,7 +338,7 @@ function makeClient(
 
 
 
-  function processMessage(data: unknown): rxjs.Observable<void | ServiceEvent> {
+  function processMessage(data: unknown): rxjs.Observable<ServiceEvent> {
     const msg = deserialize(data)
     if (msg.header.type == "SbEndpointWaitResponse") return onEndpointWaitResponse(msg)
     else if (msg.header.service) return onServiceRequest(msg)
@@ -345,7 +348,7 @@ function makeClient(
   function onServiceRequest(req: MessageWithHeader): rxjs.Observable<ServiceEvent> {
     const responseSubject = new rxjs.Subject<Message | void>()
     return rxjs.merge(
-      rxjs.of({ type: 'service-request', request: req, responseSubject } as ServiceEvent),
+      rxjs.of<ServiceEvent>({ type: 'service', request: req, responseSubject }),
       responseSubject.pipe(
         rxjs.first(null, undefined),
         rxjs.timeout(60*1000),
@@ -386,7 +389,7 @@ function makeClient(
     )
   }
 
-  function onServiceResponse(msg: MessageWithHeader): rxjs.Observable<void> {
+  function onServiceResponse(msg: MessageWithHeader): rxjs.Observable<never> {
     const pending = pendingResponses.get(msg.header.id as string)
     if (pending) {
       pending.next(msg)
@@ -396,7 +399,7 @@ function makeClient(
     }
   }
 
-  function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<void> {
+  function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<never> {
     const waiter = waitEndpoints.get(msg.header.endpointId as string)
     if (waiter) {
       waiter.closeSubject.next()
@@ -406,6 +409,8 @@ function makeClient(
       throw new Error("Stray EndpointWaitResponse")
     }
   }
+
+
 
   function send(msg: MessageWithHeader): rxjs.Observable<void> {
     return new rxjs.Observable(subscriber => {
