@@ -179,7 +179,9 @@ function makeClient(con, waitEndpoints, opts) {
     }
     function onServiceRequest(req) {
         const responseSubject = new rxjs.Subject();
-        return rxjs.merge(rxjs.of({ type: 'service', request: req, responseSubject }), responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60_000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
+        return rxjs.merge(
+        //this must come first to ensure it is subscribed before the ServiceEvent is emitted
+        responseSubject.pipe(rxjs.first(null, undefined), rxjs.timeout(60_000), rxjs.exhaustMap(res => rxjs.iif(() => req.header.id != null, send({
             header: {
                 ...res?.header,
                 ...reservedFields,
@@ -195,7 +197,7 @@ function makeClient(con, waitEndpoints, opts) {
                 type: "ServiceResponse",
                 error: err instanceof Error ? err.message : String(err)
             }
-        }), rxjs.throwError(() => new Error('Unhandled error thrown by notification handler', { cause: err })))), rxjs.ignoreElements()));
+        }), rxjs.throwError(() => new Error('Unhandled error thrown by notification handler', { cause: err })))), rxjs.ignoreElements()), rxjs.of({ type: 'service', request: req, responseSubject }));
     }
     function onServiceResponse(msg) {
         const pending = pendingResponses.get(msg.header.id);

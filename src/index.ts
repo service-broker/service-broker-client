@@ -346,7 +346,7 @@ function makeClient(
   function onServiceRequest(req: MessageWithHeader): rxjs.Observable<ServiceEvent> {
     const responseSubject = new rxjs.Subject<Message | void>()
     return rxjs.merge(
-      rxjs.of<ServiceEvent>({ type: 'service', request: req, responseSubject }),
+      //this must come first to ensure it is subscribed before the ServiceEvent is emitted
       responseSubject.pipe(
         rxjs.first(null, undefined),
         rxjs.timeout(60_000),
@@ -383,7 +383,8 @@ function makeClient(
           )
         ),
         rxjs.ignoreElements()
-      )
+      ),
+      rxjs.of<ServiceEvent>({ type: 'service', request: req, responseSubject })
     )
   }
 
