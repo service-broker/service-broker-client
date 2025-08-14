@@ -152,20 +152,19 @@ function makeClient(con, waitEndpoints, opts) {
             });
         },
         waitEndpoint(endpointId) {
-            let waiter = waitEndpoints.get(endpointId);
-            if (!waiter) {
-                const closeSubject = new rxjs.ReplaySubject();
-                waitEndpoints.set(endpointId, waiter = {
-                    closeSubject,
-                    close$: send({
+            return rxjs.defer(() => {
+                let waiter = waitEndpoints.get(endpointId);
+                if (!waiter) {
+                    waitEndpoints.set(endpointId, waiter = new rxjs.ReplaySubject());
+                    send({
                         header: {
                             type: "SbEndpointWaitRequest",
                             endpointId
                         }
-                    }).pipe(rxjs.exhaustMap(() => closeSubject), rxjs.finalize(() => waitEndpoints.delete(endpointId)))
-                });
-            }
-            return waiter.close$;
+                    }).pipe(rxjs.exhaustMap(() => waiter), rxjs.finalize(() => waitEndpoints.delete(endpointId))).subscribe();
+                }
+                return waiter;
+            });
         }
     };
     function processMessage(data) {
@@ -212,8 +211,8 @@ function makeClient(con, waitEndpoints, opts) {
     function onEndpointWaitResponse(msg) {
         const waiter = waitEndpoints.get(msg.header.endpointId);
         if (waiter) {
-            waiter.closeSubject.next();
-            waiter.closeSubject.complete();
+            waiter.next();
+            waiter.complete();
             return rxjs.EMPTY;
         }
         else {

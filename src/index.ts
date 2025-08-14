@@ -85,7 +85,7 @@ export interface ErrorEvent {
 
 
 export function connect(url: string, opts: ClientOptions = {}) {
-  const waitEndpoints: Parameters<typeof makeClient>[1] = new Map()
+  const waitEndpoints = new Map<string, rxjs.Subject<void>>()
   return connectWebSocket(url).pipe(
     rxjs.map(con => makeClient(con, waitEndpoints, opts))
   )
@@ -93,7 +93,7 @@ export function connect(url: string, opts: ClientOptions = {}) {
 
 function makeClient(
   con: Connection,
-  waitEndpoints: Map<string, { closeSubject: rxjs.Subject<void>, close$: rxjs.Observable<void> }>,
+  waitEndpoints: Map<string, rxjs.Subject<void>>,
   opts: ClientOptions
 ): Client {
   const transmit = rxjs.bindNodeCallback(con.send).bind(con)
@@ -314,23 +314,22 @@ function makeClient(
     },
 
     waitEndpoint(endpointId) {
-      let waiter = waitEndpoints.get(endpointId)
-      if (!waiter) {
-        const closeSubject = new rxjs.ReplaySubject<void>()
-        waitEndpoints.set(endpointId, waiter = {
-          closeSubject,
-          close$: send({
+      return rxjs.defer(() => {
+        let waiter = waitEndpoints.get(endpointId)
+        if (!waiter) {
+          waitEndpoints.set(endpointId, waiter = new rxjs.ReplaySubject<void>())
+          send({
             header: {
               type: "SbEndpointWaitRequest",
               endpointId
             }
           }).pipe(
-            rxjs.exhaustMap(() => closeSubject),
+            rxjs.exhaustMap(() => waiter!),
             rxjs.finalize(() => waitEndpoints.delete(endpointId))
-          )
-        })
-      }
-      return waiter.close$
+          ).subscribe()
+        }
+        return waiter
+      })
     }
   }
 
@@ -401,8 +400,8 @@ function makeClient(
   function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<never> {
     const waiter = waitEndpoints.get(msg.header.endpointId as string)
     if (waiter) {
-      waiter.closeSubject.next()
-      waiter.closeSubject.complete()
+      waiter.next()
+      waiter.complete()
       return rxjs.EMPTY
     } else {
       throw new Error("Stray EndpointWaitResponse")

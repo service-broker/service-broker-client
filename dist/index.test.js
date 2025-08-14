@@ -89,10 +89,12 @@ describe('config', ({ beforeEach, afterEach, test }) => {
         expect(request.payload, 'text');
         const clientEndpointId = request.header.from;
         provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect', 0));
+        provider.waitEndpoint(clientEndpointId).subscribe(() => queue.push('disconnect2', 0));
         await new Promise(f => setTimeout(f, 100));
         client.close();
         await queue.wait('CloseEvent');
         await queue.wait('disconnect');
+        queue.take('disconnect2');
     });
     test('reconnect-wait-endpoint', async () => {
         subs.push(sbConnect(serviceBrokerUrl, queue));

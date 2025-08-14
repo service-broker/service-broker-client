@@ -1,6 +1,6 @@
 {
   "name": "@service-broker/client-node",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "description": "Node ESM client library for interacting with a service broker",
   "type": "module",
   "main": "dist/index.js",
