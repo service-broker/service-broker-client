@@ -1,3 +1,4 @@
+import { ClientRequestArgs } from "http";
 import * as rxjs from "rxjs";
 import { Readable } from "stream";
 import WebSocket from "ws";
@@ -9,14 +10,15 @@ export interface MessageWithHeader extends Message {
     header: Record<string, unknown>;
 }
 export interface ClientOptions {
+    websocketOptions?: WebSocket.ClientOptions | ClientRequestArgs;
     keepAlive?: {
         pingInterval: number;
         pongTimeout: number;
     };
     streamingChunkSize?: number;
+    handle?: (request$: rxjs.Observable<MessageWithHeader>) => rxjs.Observable<RespondAction | ErrorEvent>;
 }
 export interface Client {
-    request$: rxjs.Observable<ServiceEvent>;
     error$: rxjs.Observable<ErrorEvent>;
     close$: rxjs.Observable<WebSocket.CloseEvent>;
     close: WebSocket['close'];
@@ -47,10 +49,10 @@ export interface Client {
     cleanup(): rxjs.Observable<void>;
     waitEndpoint(endpointId: string): rxjs.Observable<void>;
 }
-export interface ServiceEvent {
-    type: 'service';
+export interface RespondAction {
+    type: 'respond';
     request: MessageWithHeader;
-    responseSubject: rxjs.Subject<Message | void>;
+    response: Message;
 }
 export interface ErrorEvent {
     type: 'error';

@@ -1,4 +1,5 @@
 import { Connection, connect as connectWebSocket } from "@service-broker/websocket";
+import { ClientRequestArgs } from "http";
 import * as rxjs from "rxjs";
 import { PassThrough, Readable } from "stream";
 import WebSocket from "ws";
@@ -27,15 +28,16 @@ const reservedFields: Record<string, void> = {
 
 
 export interface ClientOptions {
+  websocketOptions?: WebSocket.ClientOptions | ClientRequestArgs
   keepAlive?: {
     pingInterval: number
     pongTimeout: number
   },
   streamingChunkSize?: number
+  handle?: (request$: rxjs.Observable<MessageWithHeader>) => rxjs.Observable<RespondAction | ErrorEvent>
 }
 
 export interface Client {
-  request$: rxjs.Observable<ServiceEvent>
   error$: rxjs.Observable<ErrorEvent>
   close$: rxjs.Observable<WebSocket.CloseEvent>
   close: WebSocket['close']
@@ -70,10 +72,10 @@ export interface Client {
   waitEndpoint(endpointId: string): rxjs.Observable<void>
 }
 
-export interface ServiceEvent {
-  type: 'service'
+export interface RespondAction {
+  type: 'respond'
   request: MessageWithHeader
-  responseSubject: rxjs.Subject<Message | void>
+  response: Message
 }
 
 export interface ErrorEvent {
@@ -86,7 +88,7 @@ export interface ErrorEvent {
 
 export function connect(url: string, opts: ClientOptions = {}) {
   const waitEndpoints = new Map<string, rxjs.Subject<void>>()
-  return connectWebSocket(url).pipe(
+  return connectWebSocket(url, opts.websocketOptions).pipe(
     rxjs.map(con => makeClient(con, waitEndpoints, opts))
   )
 }
@@ -151,21 +153,41 @@ function makeClient(
       )
     )
   ).pipe(
-    rxjs.share()
+   rxjs.share()
   )
 
-  const receive$ = con.message$.pipe(
-    rxjs.mergeMap(event =>
-      processMessage(event.data).pipe(
-        rxjs.catchError(err =>
-          rxjs.of<ErrorEvent>({
-            type: 'error',
-            error: err,
-            detail: { method: 'receive', data: event.data }
-          })
-        )
+  const [endpointWaitResponse$, other$] = rxjs.partition(
+    con.message$.pipe(
+      rxjs.map(event => deserialize(event.data)),
+      rxjs.share()
+    ),
+    msg => msg.header.type == 'SbEndpointWaitResponse'
+  )
+  const [serviceRequest$, serviceResponse$] = rxjs.partition(
+    other$,
+    msg => msg.header.service != null
+  )
+  const receive$ = rxjs.merge(
+    endpointWaitResponse$.pipe(
+      rxjs.mergeMap(onEndpointWaitResponse)
+    ),
+    opts.handle ? opts.handle(serviceRequest$).pipe(
+      rxjs.mergeMap(event =>
+        event.type == 'respond' ? sendServiceResponse(event.request, event.response) : rxjs.of(event)
+      )
+    ) : serviceRequest$.pipe(
+      rxjs.mergeMap(request =>
+        sendServiceResponse(request, {
+          header: {
+            error: 'NO_SERVICE'
+          }
+        })
       )
     ),
+    serviceResponse$.pipe(
+      rxjs.mergeMap(onServiceResponse)
+    )
+  ).pipe(
     rxjs.share()
   )
 
@@ -206,19 +228,16 @@ function makeClient(
     keepAlive$,
   ).pipe(
     rxjs.takeUntil(con.close$)
-  ).subscribe()
+  ).subscribe().add(() => {
+    const err = new Error('Service broker connection lost')
+    for (const pending of pendingResponses.values()) pending.error(err)
+  })
 
   //return the API
   return {
-    request$: receive$.pipe(
-      rxjs.filter(event => event.type == 'service')
-    ),
-
     error$: rxjs.merge(
       send$,
-      receive$.pipe(
-        rxjs.filter(event => event.type == 'error')
-      ),
+      receive$,
       error$,
       doOnce$,
       keepAlive$,
@@ -324,9 +343,14 @@ function makeClient(
               endpointId
             }
           }).pipe(
+            rxjs.catchError(err => {
+              waiter!.error(err)
+              return rxjs.EMPTY
+            }),
             rxjs.exhaustMap(() => waiter!),
-            rxjs.finalize(() => waitEndpoints.delete(endpointId))
-          ).subscribe()
+          ).subscribe().add(() => {
+            waitEndpoints.delete(endpointId)
+          })
         }
         return waiter
       })
@@ -335,76 +359,63 @@ function makeClient(
 
 
 
-  function processMessage(data: unknown): rxjs.Observable<ServiceEvent> {
-    const msg = deserialize(data)
-    if (msg.header.type == "SbEndpointWaitResponse") return onEndpointWaitResponse(msg)
-    else if (msg.header.service) return onServiceRequest(msg)
-    else return onServiceResponse(msg)
-  }
-
-  function onServiceRequest(req: MessageWithHeader): rxjs.Observable<ServiceEvent> {
-    const responseSubject = new rxjs.Subject<Message | void>()
-    return rxjs.merge(
-      //this must come first to ensure it is subscribed before the ServiceEvent is emitted
-      responseSubject.pipe(
-        rxjs.first(null, undefined),
-        rxjs.timeout(60_000),
-        rxjs.exhaustMap(res =>
-          rxjs.iif(
-            () => req.header.id != null,
-            send({
-              header: {
-                ...res?.header,
-                ...reservedFields,
-                to: req.header.from,
-                id: req.header.id,
-                type: "ServiceResponse"
-              },
-              payload: res?.payload
-            }),
-            rxjs.EMPTY
-          )
-        ),
+  function sendServiceResponse(req: MessageWithHeader, res: Message): rxjs.Observable<ErrorEvent> {
+    return rxjs.iif(
+      () => req.header.id != null,
+      send({
+        header: {
+          ...res.header,
+          ...reservedFields,
+          to: req.header.from,
+          id: req.header.id,
+          type: "ServiceResponse",
+          error: res.header?.error,
+        },
+        payload: res.payload
+      }).pipe(
+        rxjs.ignoreElements(),
         rxjs.catchError(err =>
-          rxjs.iif(
-            () => req.header.id != null,
-            send({
-              header: {
-                to: req.header.from,
-                id: req.header.id,
-                type: "ServiceResponse",
-                error: err instanceof Error ? err.message : String(err)
-              }
-            }),
-            rxjs.throwError(() =>
-              new Error('Unhandled error thrown by notification handler', { cause: err })
-            )
-          )
-        ),
-        rxjs.ignoreElements()
+          rxjs.of<ErrorEvent>({
+            type: 'error',
+            error: err,
+            detail: { method: 'sendServiceResponse', req, res }
+          })
+        )
       ),
-      rxjs.of<ServiceEvent>({ type: 'service', request: req, responseSubject })
+      rxjs.of<ErrorEvent>({
+        type: 'error',
+        error: new Error('Should not respond to a notification'),
+        detail: { method: 'sendServiceResponse', req, res }
+      })
     )
   }
 
-  function onServiceResponse(msg: MessageWithHeader): rxjs.Observable<never> {
+  function onServiceResponse(msg: MessageWithHeader): rxjs.Observable<ErrorEvent> {
     const pending = pendingResponses.get(msg.header.id as string)
     if (pending) {
       pending.next(msg)
       return rxjs.EMPTY
     } else {
-      throw new Error("Stray ServiceResponse")
+      return rxjs.of<ErrorEvent>({
+        type: 'error',
+        error: new Error("Stray ServiceResponse"),
+        detail: { method: "onServiceResponse", msg }
+      })
     }
   }
 
-  function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<never> {
+  function onEndpointWaitResponse(msg: MessageWithHeader): rxjs.Observable<ErrorEvent> {
     const waiter = waitEndpoints.get(msg.header.endpointId as string)
     if (waiter) {
       waiter.next()
       waiter.complete()
       return rxjs.EMPTY
     } else {
-      throw new Error("Stray EndpointWaitResponse")
+      return rxjs.of<ErrorEvent>({
+        type: 'error',
+        error: new Error("Stray EndpointWaitResponse"),
+        detail: { method: 'onEndpointWaitResponse', msg }
+      })
     }
   }
 
@@ -433,23 +444,23 @@ function makeClient(
           timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout),
           rxjs.exhaustMap(res =>
             rxjs.iif(
-              () => !!res.header.part,
-              rxjs.defer(() => {
-                const stream = new PassThrough()
-                const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream)
-                return src$.pipe(
-                  rxjs.timeout(60_000),
-                  rxjs.startWith(res),
-                  rxjs.takeWhile(msg => !!msg.header.part, true),
-                  rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY),
-                  rxjs.finalize(() => stream.end()),
-                  rxjs.ignoreElements(),
-                  rxjs.startWith({ header: res.header, payload: stream })
-                )
-              }),
+              () => !!res.header.error,
+              rxjs.throwError(() => typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error),
               rxjs.iif(
-                () => !!res.header.error,
-                rxjs.throwError(() => typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error),
+                () => !!res.header.part,
+                rxjs.defer(() => {
+                  const stream = new PassThrough()
+                  const streamWrite = rxjs.bindNodeCallback(stream.write).bind(stream)
+                  return src$.pipe(
+                    rxjs.timeout(60_000),
+                    rxjs.startWith(res),
+                    rxjs.takeWhile(msg => !!msg.header.part, true),
+                    rxjs.concatMap(msg => msg.payload ? streamWrite(msg.payload, 'utf8') : rxjs.EMPTY),
+                    rxjs.finalize(() => stream.end()),
+                    rxjs.ignoreElements(),
+                    rxjs.startWith({ header: res.header, payload: stream })
+                  )
+                }),
                 rxjs.of(res)
               )
             )

@@ -14,9 +14,19 @@ function lvf(v$) {
     return rxjs.lastValueFrom(v$);
 }
 function sbConnect(url, queue, opts) {
+    opts = {
+        handle(request$) {
+            return request$.pipe(rxjs.mergeMap(request => {
+                const event = { request, responseSubject: new rxjs.Subject() };
+                queue.push('ServiceEvent', event);
+                return event.responseSubject.pipe(rxjs.take(1), rxjs.map((res) => ({ type: 'respond', request, response: res ?? {} })));
+            }));
+        },
+        ...opts
+    };
     return connect(url, opts).pipe(rxjs.exhaustMap(sb => {
         queue.push('ServiceBroker', sb);
-        return rxjs.merge(sb.request$.pipe(rxjs.tap(event => queue.push('ServiceEvent', event))), sb.error$.pipe(rxjs.tap(event => queue.push('ErrorEvent', event)))).pipe(rxjs.takeUntil(sb.close$.pipe(rxjs.tap(event => queue.push('CloseEvent', event)))), rxjs.finalize(() => sb.close()));
+        return rxjs.merge(sb.error$.pipe(rxjs.tap(event => queue.push('ErrorEvent', event)))).pipe(rxjs.takeUntil(sb.close$.pipe(rxjs.tap(event => queue.push('CloseEvent', event)))), rxjs.finalize(() => sb.close()));
     }), rxjs.repeat({ delay: 100 })).subscribe({
         error: err => queue.push('Error', err)
     });

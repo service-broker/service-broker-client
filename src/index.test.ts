@@ -3,7 +3,7 @@ import assert from "assert"
 import dotenv from "dotenv"
 import * as rxjs from "rxjs"
 import { PassThrough, Readable } from "stream"
-import { ClientOptions, connect, Client as ServiceBroker, ServiceEvent } from "./index.js"
+import { ClientOptions, connect, Message, MessageWithHeader, RespondAction, Client as ServiceBroker } from "./index.js"
 
 dotenv.config({ quiet: true })
 
@@ -19,14 +19,31 @@ function lvf<T>(v$: rxjs.Observable<T>) {
   return rxjs.lastValueFrom(v$)
 }
 
+interface ServiceEvent {
+  request: MessageWithHeader
+  responseSubject: rxjs.Subject<Message | void>
+}
+
 function sbConnect(url: string, queue: ReturnType<typeof makeQueue>, opts?: ClientOptions) {
+  opts = {
+    handle(request$) {
+      return request$.pipe(
+        rxjs.mergeMap(request => {
+          const event: ServiceEvent = { request, responseSubject: new rxjs.Subject() }
+          queue.push('ServiceEvent', event)
+          return event.responseSubject.pipe(
+            rxjs.take(1),
+            rxjs.map((res): RespondAction => ({ type: 'respond', request, response: res ?? {} }))
+          )
+        })
+      )
+    },
+    ...opts
+  }
   return connect(url, opts).pipe(
     rxjs.exhaustMap(sb => {
       queue.push('ServiceBroker', sb)
       return rxjs.merge(
-        sb.request$.pipe(
-          rxjs.tap(event => queue.push('ServiceEvent', event))
-        ),
         sb.error$.pipe(
           rxjs.tap(event => queue.push('ErrorEvent', event))
         )
