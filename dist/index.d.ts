@@ -1,38 +1,44 @@
+import { Connection } from "@service-broker/websocket";
+import EventEmitter from "events";
+import { ClientRequestArgs } from "http";
+import * as rxjs from "rxjs";
 import { Readable } from "stream";
+import WebSocket from "ws";
 export interface Message {
-    header?: {
-        [key: string]: any;
-    };
+    header?: Record<string, unknown>;
     payload?: string | Buffer | Readable;
 }
 export interface MessageWithHeader extends Message {
-    header: {
-        [key: string]: any;
-    };
+    header: Record<string, unknown>;
 }
-interface Logger {
-    info: Console["info"];
-    error: Console["error"];
+interface EventMap {
+    connect: [];
+    close: [number, string];
+    error: [unknown];
 }
-export declare class ServiceBroker {
+export declare class ServiceBroker extends EventEmitter<EventMap> {
     private opts;
     private readonly connection$;
     private readonly providers;
     private readonly pending;
     private pendingIdGen;
-    private logger;
     private readonly shutdown$;
     constructor(opts: {
         url: string;
+        websocketOptions?: WebSocket.ClientOptions | ClientRequestArgs;
         authToken?: string;
-        onConnect?: () => void;
-        disableAutoReconnect?: boolean;
-        keepAliveIntervalSeconds?: number;
-        logger?: Logger;
+        retryConfig?: rxjs.RetryConfig;
+        repeatConfig?: rxjs.RepeatConfig;
+        keepAlive?: {
+            pingInterval: number;
+            pongTimeout: number;
+        };
+        streamingChunkSize?: number;
     });
     private onMessage;
     private onServiceRequest;
     private onServiceResponse;
+    private onEndpointWaitResponse;
     private messageFromString;
     private messageFromBuffer;
     private send;
@@ -41,8 +47,8 @@ export declare class ServiceBroker {
         name: string;
         capabilities?: string[];
         priority?: number;
-    }, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): Promise<void>;
-    unadvertise(serviceName: string): Promise<void>;
+    }, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): Promise<Message>;
+    unadvertise(serviceName: string): Promise<Message>;
     setServiceHandler(serviceName: string, handler: (msg: MessageWithHeader) => Message | void | Promise<Message | void>): void;
     request(service: {
         name: string;
@@ -61,8 +67,8 @@ export declare class ServiceBroker {
     status(): Promise<any>;
     cleanup(): Promise<void>;
     private readonly waitPromises;
-    private wait;
-    waitEndpoint(endpointId: string): Promise<void>;
+    waitEndpoint(endpointId: string): Promise<unknown>;
     shutdown(): void;
+    debugGetConnection(): Promise<Connection | null>;
 }
 export {};
