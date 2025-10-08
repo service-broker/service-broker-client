@@ -13,17 +13,6 @@ const reservedFields = {
     service: undefined,
     part: undefined
 };
-function pTimeout(promise, millis) {
-    if (millis == Infinity)
-        return promise;
-    let timer;
-    return Promise.race([
-        promise
-            .finally(() => clearTimeout(timer)),
-        new Promise(f => timer = setTimeout(f, millis))
-            .then(() => Promise.reject(new Error("Timeout")))
-    ]);
-}
 function assertRecord(obj) {
 }
 export class ServiceBroker extends EventEmitter {
@@ -125,7 +114,7 @@ export class ServiceBroker extends EventEmitter {
         assert(typeof msg.header.id == 'string', 'BAD_ARGS id');
         const pending = this.pending.get(msg.header.id);
         assert(pending, 'Stray serviceResponse');
-        pending(msg);
+        pending.next(msg);
     }
     onEndpointWaitResponse(msg) {
         assert(typeof msg.header.endpointId == 'string', 'BAD_ARGS endpointId');
@@ -219,12 +208,22 @@ export class ServiceBroker extends EventEmitter {
             advertise: true
         });
         const id = String(++this.pendingIdGen);
-        await this.send({
-            id,
-            authToken: this.opts.authToken,
-            type: "SbAdvertiseRequest",
-        }, JSON.stringify(Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)));
-        return this.pendingResponse(id);
+        if (process.env.OLD_ADVERTISE) {
+            await this.send({
+                id,
+                authToken: this.opts.authToken,
+                type: "SbAdvertiseRequest",
+                services: Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)
+            });
+        }
+        else {
+            await this.send({
+                id,
+                authToken: this.opts.authToken,
+                type: "SbAdvertiseRequest",
+            }, JSON.stringify(Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)));
+        }
+        return await this.pendingResponse(id);
     }
     async unadvertise(serviceName) {
         assert(this.providers.delete(serviceName), `${serviceName} provider not exists`);
@@ -234,7 +233,7 @@ export class ServiceBroker extends EventEmitter {
             authToken: this.opts.authToken,
             type: "SbAdvertiseRequest",
         }, JSON.stringify(Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)));
-        return this.pendingResponse(id);
+        return await this.pendingResponse(id);
     }
     setServiceHandler(serviceName, handler) {
         assert(!this.providers.has(serviceName), `${serviceName} provider already exists`);
@@ -252,7 +251,7 @@ export class ServiceBroker extends EventEmitter {
             service
         };
         await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-        return this.pendingResponse(id, timeout);
+        return await this.pendingResponse(id, timeout);
     }
     async notify(service, msg) {
         const header = {
@@ -270,7 +269,7 @@ export class ServiceBroker extends EventEmitter {
             service: { name: serviceName }
         };
         await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-        return this.pendingResponse(id, timeout);
+        return await this.pendingResponse(id, timeout);
     }
     async notifyTo(endpointId, serviceName, msg) {
         const header = {
@@ -280,34 +279,24 @@ export class ServiceBroker extends EventEmitter {
         };
         await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
     }
-    pendingResponse(id, timeout) {
-        const promise = new Promise((fulfill, reject) => {
-            let stream;
-            this.pending.set(id, res => {
-                if (res.header.error) {
-                    reject(typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error);
-                }
-                else {
-                    if (res.header.part) {
-                        if (!stream)
-                            fulfill({ header: res.header, payload: stream = new PassThrough() });
-                        stream.write(res.payload);
-                    }
-                    else {
-                        this.pending.delete(id);
-                        if (stream)
-                            stream.end(res.payload);
-                        else
-                            fulfill(res);
-                    }
-                }
-            });
-        });
-        return pTimeout(promise, timeout || 30_000)
-            .catch(err => {
-            this.pending.delete(id);
-            throw err;
-        });
+    async pendingResponse(id, timeout = 30_000) {
+        const subject = new rxjs.Subject();
+        this.pending.set(id, subject);
+        try {
+            return await rxjs.firstValueFrom(subject.pipe(rxjs.first(), timeout == 0 || timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout), rxjs.exhaustMap(first => {
+                if (first.header.error)
+                    throw first.header.error;
+                if (!first.header.part)
+                    return rxjs.of(first);
+                const stream = new PassThrough();
+                return subject.pipe(rxjs.timeout(30_000), rxjs.takeWhile(res => !!res.header.part, true), rxjs.startWith(first), rxjs.concatMap(res => rxjs.iif(() => res.payload != undefined, new rxjs.Observable(subscriber => {
+                    stream.write(res.payload, err => err ? subscriber.error(err) : subscriber.complete());
+                }), rxjs.EMPTY)), rxjs.finalize(() => stream.end()), rxjs.startWith({ header: first.header, payload: stream }));
+            }), rxjs.finalize(() => this.pending.delete(id))));
+        }
+        catch (err) {
+            throw typeof err == 'string' ? new Error(err) : err;
+        }
     }
     async publish(topic, text) {
         await this.send({
@@ -346,13 +335,13 @@ export class ServiceBroker extends EventEmitter {
             this.waitPromises.set(endpointId, waiter = new rxjs.ReplaySubject());
             waiter.subscribe().add(() => this.waitPromises.delete(endpointId));
         }
-        return rxjs.firstValueFrom(waiter);
+        return await rxjs.firstValueFrom(waiter);
     }
     shutdown() {
         this.shutdown$.next();
     }
-    debugGetConnection() {
-        return rxjs.firstValueFrom(this.connection$);
+    async debugGetConnection() {
+        return await rxjs.firstValueFrom(this.connection$);
     }
 }
 //# sourceMappingURL=index.js.map

@@ -36,17 +36,6 @@ const reservedFields: Record<string, void> = {
   part: undefined
 };
 
-function pTimeout<T>(promise: Promise<T>, millis: number): Promise<T> {
-  if (millis == Infinity) return promise
-  let timer: NodeJS.Timeout
-  return Promise.race([
-    promise
-      .finally(() => clearTimeout(timer)),
-    new Promise(f => timer = setTimeout(f, millis))
-      .then(() => Promise.reject(new Error("Timeout")))
-  ])
-}
-
 function assertRecord(obj: object): asserts obj is Record<string, unknown> {
 }
 
@@ -60,7 +49,7 @@ interface EventMap {
 export class ServiceBroker extends EventEmitter<EventMap> {
   private readonly connection$: rxjs.Observable<Connection | null>
   private readonly providers: Map<string, Provider>
-  private readonly pending: Map<string, (msg: MessageWithHeader) => void>
+  private readonly pending: Map<string, rxjs.Subject<MessageWithHeader>>
   private pendingIdGen: number;
   private readonly shutdown$: rxjs.Subject<void>
 
@@ -192,7 +181,7 @@ export class ServiceBroker extends EventEmitter<EventMap> {
     assert(typeof msg.header.id == 'string', 'BAD_ARGS id')
     const pending = this.pending.get(msg.header.id)
     assert(pending, 'Stray serviceResponse')
-    pending(msg)
+    pending.next(msg)
   }
 
   private onEndpointWaitResponse(msg: MessageWithHeader) {
@@ -293,14 +282,23 @@ export class ServiceBroker extends EventEmitter<EventMap> {
       advertise: true
     })
     const id = String(++this.pendingIdGen)
-    await this.send({
-      id,
-      authToken: this.opts.authToken,
-      type: "SbAdvertiseRequest",
-    }, JSON.stringify(
-      Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)
-    ))
-    return this.pendingResponse(id)
+    if (process.env.OLD_ADVERTISE) {
+      await this.send({
+        id,
+        authToken: this.opts.authToken,
+        type: "SbAdvertiseRequest",
+        services: Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)
+      })
+    } else {
+      await this.send({
+        id,
+        authToken: this.opts.authToken,
+        type: "SbAdvertiseRequest",
+      }, JSON.stringify(
+        Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)
+      ))
+    }
+    return await this.pendingResponse(id)
   }
 
   async unadvertise(serviceName: string) {
@@ -313,7 +311,7 @@ export class ServiceBroker extends EventEmitter<EventMap> {
     }, JSON.stringify(
       Array.from(this.providers.values()).filter(x => x.advertise).map(x => x.service)
     ))
-    return this.pendingResponse(id)
+    return await this.pendingResponse(id)
   }
 
   setServiceHandler(serviceName: string, handler: (msg: MessageWithHeader) => Message|void|Promise<Message|void>) {
@@ -335,7 +333,7 @@ export class ServiceBroker extends EventEmitter<EventMap> {
       service
     };
     await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-    return this.pendingResponse(id, timeout)
+    return await this.pendingResponse(id, timeout)
   }
 
   async notify(service: {name: string, capabilities?: string[]}, msg: Message): Promise<void> {
@@ -355,7 +353,7 @@ export class ServiceBroker extends EventEmitter<EventMap> {
       service: {name: serviceName}
     }
     await this.send(Object.assign({}, req.header, reservedFields, header), req.payload);
-    return this.pendingResponse(id, timeout)
+    return await this.pendingResponse(id, timeout)
   }
 
   async notifyTo(endpointId: string, serviceName: string, msg: Message): Promise<void> {
@@ -367,31 +365,41 @@ export class ServiceBroker extends EventEmitter<EventMap> {
     await this.send(Object.assign({}, msg.header, reservedFields, header), msg.payload);
   }
 
-  private pendingResponse(id: string, timeout?: number): Promise<Message> {
-    const promise: Promise<Message> = new Promise((fulfill, reject) => {
-      let stream: PassThrough;
-      this.pending.set(id, res => {
-        if (res.header.error) {
-          reject(typeof res.header.error == 'string' ? new Error(res.header.error) : res.header.error)
-        }
-        else {
-          if (res.header.part) {
-            if (!stream) fulfill({header: res.header, payload: stream = new PassThrough()});
-            stream.write(res.payload);
-          }
-          else {
-            this.pending.delete(id)
-            if (stream) stream.end(res.payload);
-            else fulfill(res);
-          }
-        }
-      })
-    });
-    return pTimeout(promise, timeout || 30_000)
-      .catch(err => {
-        this.pending.delete(id)
-        throw err;
-      });
+  private async pendingResponse(id: string, timeout = 30_000): Promise<Message> {
+    const subject = new rxjs.Subject<MessageWithHeader>()
+    this.pending.set(id, subject)
+    try {
+      return await rxjs.firstValueFrom(
+        subject.pipe(
+          rxjs.first(),
+          timeout == 0 || timeout == Infinity ? rxjs.identity : rxjs.timeout(timeout),
+          rxjs.exhaustMap(first => {
+            if (first.header.error) throw first.header.error
+            if (!first.header.part) return rxjs.of(first)
+            const stream = new PassThrough()
+            return subject.pipe(
+              rxjs.timeout(30_000),
+              rxjs.takeWhile(res => !!res.header.part, true),
+              rxjs.startWith(first),
+              rxjs.concatMap(res =>
+                rxjs.iif(
+                  () => res.payload != undefined,
+                  new rxjs.Observable<never>(subscriber => {
+                    stream.write(res.payload, err => err ? subscriber.error(err) : subscriber.complete())
+                  }),
+                  rxjs.EMPTY
+                )
+              ),
+              rxjs.finalize(() => stream.end()),
+              rxjs.startWith({ header: first.header, payload: stream })
+            )
+          }),
+          rxjs.finalize(() => this.pending.delete(id))
+        )
+      )
+    } catch (err) {
+      throw typeof err == 'string' ? new Error(err) : err
+    }
   }
 
 
@@ -444,14 +452,14 @@ export class ServiceBroker extends EventEmitter<EventMap> {
       this.waitPromises.set(endpointId, waiter = new rxjs.ReplaySubject())
       waiter.subscribe().add(() => this.waitPromises.delete(endpointId))
     }
-    return rxjs.firstValueFrom(waiter)
+    return await rxjs.firstValueFrom(waiter)
   }
 
   shutdown() {
     this.shutdown$.next()
   }
 
-  debugGetConnection() {
-    return rxjs.firstValueFrom(this.connection$)
+  async debugGetConnection() {
+    return await rxjs.firstValueFrom(this.connection$)
   }
 }
